@@ -39,6 +39,7 @@ import {
 import { CloudInitializingView } from "./CloudInitializingView";
 import { ConversationView } from "./ConversationView";
 import { DropZoneOverlay } from "./DropZoneOverlay";
+import { ForkedFromBanner } from "./ForkedFromBanner";
 import { ModelSelector } from "./ModelSelector";
 import { PlanStatusBar } from "./PlanStatusBar";
 import { ReasoningLevelSelector } from "./ReasoningLevelSelector";
@@ -453,6 +454,7 @@ export function SessionView({
           >
             {isSuspended ? (
               <>
+                {taskId && <ForkedFromBanner taskId={taskId} />}
                 <ConversationView
                   events={events}
                   isPromptPending={isPromptPending}
@@ -524,6 +526,7 @@ export function SessionView({
             ) : (
               <>
                 <DropZoneOverlay isVisible={isDraggingFile} />
+                {taskId && <ForkedFromBanner taskId={taskId} />}
                 <ConversationView
                   events={events}
                   isPromptPending={isPromptPending}

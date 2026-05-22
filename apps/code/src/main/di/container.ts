@@ -4,6 +4,7 @@ import { Container } from "inversify";
 import { ArchiveRepository } from "../db/repositories/archive-repository";
 import { AuthPreferenceRepository } from "../db/repositories/auth-preference-repository";
 import { AuthSessionRepository } from "../db/repositories/auth-session-repository";
+import { ForkRelationshipRepository } from "../db/repositories/fork-relationship-repository";
 import { RepositoryRepository } from "../db/repositories/repository-repository";
 import { SuspensionRepositoryImpl } from "../db/repositories/suspension-repository";
 import { WorkspaceRepository } from "../db/repositories/workspace-repository";
@@ -41,6 +42,7 @@ import { FileWatcherService } from "../services/file-watcher/service";
 import { FocusService } from "../services/focus/service";
 import { FocusSyncService } from "../services/focus/sync-service";
 import { FoldersService } from "../services/folders/service";
+import { ForkService } from "../services/fork/service";
 import { FsService } from "../services/fs/service";
 import { GitService } from "../services/git/service";
 import { GitHubIntegrationService } from "../services/github-integration/service";
@@ -95,6 +97,9 @@ container.bind(MAIN_TOKENS.AuthSessionRepository).to(AuthSessionRepository);
 container.bind(MAIN_TOKENS.RepositoryRepository).to(RepositoryRepository);
 container.bind(MAIN_TOKENS.WorkspaceRepository).to(WorkspaceRepository);
 container.bind(MAIN_TOKENS.WorktreeRepository).to(WorktreeRepository);
+container
+  .bind(MAIN_TOKENS.ForkRelationshipRepository)
+  .to(ForkRelationshipRepository);
 container.bind(MAIN_TOKENS.ArchiveRepository).to(ArchiveRepository);
 container.bind(MAIN_TOKENS.SuspensionRepository).to(SuspensionRepositoryImpl);
 container.bind(MAIN_TOKENS.AgentAuthAdapter).to(AgentAuthAdapter);
@@ -142,5 +147,6 @@ container.bind(MAIN_TOKENS.TaskLinkService).to(TaskLinkService);
 container.bind(MAIN_TOKENS.InboxLinkService).to(InboxLinkService);
 container.bind(MAIN_TOKENS.WatcherRegistryService).to(WatcherRegistryService);
 container.bind(MAIN_TOKENS.WorkspaceService).to(WorkspaceService);
+container.bind(MAIN_TOKENS.ForkService).to(ForkService);
 
 container.bind(MAIN_TOKENS.SettingsStore).toConstantValue(settingsStore);
