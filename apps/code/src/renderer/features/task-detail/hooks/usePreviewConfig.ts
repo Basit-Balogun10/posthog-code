@@ -111,6 +111,7 @@ export function usePreviewConfig(
           lastUsedInitialTaskMode,
           defaultReasoningEffort,
           lastUsedReasoningEffort,
+          lastUsedModel,
         } = useSettingsStore.getState();
 
         // Use the mode option's existing currentValue (set by the server
@@ -186,7 +187,20 @@ export function usePreviewConfig(
           return opt;
         });
 
-        setConfigOptions(withEffort);
+        const withModel = withEffort.map((opt) => {
+          if (opt.category !== "model" || opt.type !== "select") return opt;
+          if (!lastUsedModel) return opt;
+          const validValues = flattenValues(
+            opt.options as Array<{
+              value?: string;
+              options?: Array<{ value: string }>;
+            }>,
+          );
+          if (!validValues.includes(lastUsedModel)) return opt;
+          return { ...opt, currentValue: lastUsedModel } as SessionConfigOption;
+        });
+
+        setConfigOptions(withModel);
         setIsLoading(false);
       })
       .catch((error) => {

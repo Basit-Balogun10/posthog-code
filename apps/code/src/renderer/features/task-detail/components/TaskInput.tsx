@@ -96,6 +96,7 @@ export function TaskInput({
     defaultInitialTaskMode,
     lastUsedInitialTaskMode,
     setLastUsedReasoningEffort,
+    setLastUsedModel,
   } = useSettingsStore();
 
   const editorRef = useRef<EditorHandle>(null);
@@ -493,9 +494,10 @@ export function TaskInput({
     (value: string) => {
       if (modelOption) {
         setConfigOption(modelOption.id, value);
+        setLastUsedModel(value);
       }
     },
-    [modelOption, setConfigOption],
+    [modelOption, setConfigOption, setLastUsedModel],
   );
 
   const handleThoughtChange = useCallback(
