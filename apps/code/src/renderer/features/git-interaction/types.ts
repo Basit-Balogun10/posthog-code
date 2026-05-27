@@ -5,7 +5,11 @@ export type GitMenuActionId =
   | "publish"
   | "create-pr"
   | "view-pr"
-  | "branch-here";
+  | "branch-here"
+  | "stack-submit"
+  | "stack-sync"
+  | "stack-create"
+  | "stack-modify";
 
 export interface GitMenuAction {
   id: GitMenuActionId;

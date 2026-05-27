@@ -23,6 +23,7 @@ interface GitState {
     headBranch: string | null;
     prUrl: string | null;
   } | null;
+  isGraphiteRepo?: boolean;
 }
 
 interface GitComputed {
@@ -170,6 +171,28 @@ function getPrimaryAction(
 
 export function computeGitInteractionState(input: GitState): GitComputed {
   const repoReason = getRepoReason(input);
+
+  // When in a Graphite repo, replace the standard git actions with Graphite
+  // stack operations. The normal push/PR flow doesn't apply here.
+  if (input.isGraphiteRepo) {
+    const modifyAction = makeAction("stack-modify", "Amend", repoReason);
+    const submitAction = makeAction("stack-submit", "Submit Stack", repoReason);
+    const syncAction = makeAction("stack-sync", "Sync", repoReason);
+    const createAction = makeAction("stack-create", "Stack Branch", repoReason);
+    const primaryAction = input.hasChanges ? modifyAction : submitAction;
+
+    return {
+      actions: [submitAction, modifyAction, syncAction, createAction],
+      primaryAction,
+      pushDisabledReason: null,
+      prBaseBranch: input.defaultBranch,
+      prHeadBranch: input.currentBranch,
+      prUrl: null,
+      baseReason: repoReason,
+      isDetachedHead: false,
+    };
+  }
+
   const detachedHead = isDetachedHead(input);
 
   if (detachedHead) {

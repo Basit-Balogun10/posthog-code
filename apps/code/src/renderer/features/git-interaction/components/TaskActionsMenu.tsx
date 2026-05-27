@@ -4,7 +4,15 @@ import {
   GitBranchDialog,
   GitCommitDialog,
   GitPushDialog,
+  StackCreateDialog,
+  StackModifyDialog,
+  StackSubmitDialog,
+  StackSyncDialog,
 } from "@features/git-interaction/components/GitInteractionDialogs";
+import {
+  StackPopover,
+  StackVisualization,
+} from "@features/git-interaction/components/StackVisualization";
 import { PRBadgeLink } from "@features/git-interaction/components/PRBadgeLink";
 import {
   type GitMenuAction,
@@ -102,7 +110,7 @@ export function TaskActionsMenu({ taskId, isCloud }: TaskActionsMenuProps) {
 
   return (
     <>
-      <div className="no-drag">
+      <div className="no-drag flex items-center gap-1.5">
         {pr ? (
           <PrBadgeControl
             prUrl={pr.url}
@@ -122,6 +130,14 @@ export function TaskActionsMenu({ taskId, isCloud }: TaskActionsMenuProps) {
             onSelect={gitActions.openAction}
           />
         )}
+        {gitState.isGraphiteRepo &&
+          gitState.graphiteStack?.currentStack &&
+          gitState.graphiteStack.currentStack.length > 0 && (
+            <StackPopover
+              trunk={gitState.graphiteStack.trunk}
+              entries={gitState.graphiteStack.currentStack}
+            />
+          )}
       </div>
 
       {!isCloud && (
@@ -196,6 +212,60 @@ export function TaskActionsMenu({ taskId, isCloud }: TaskActionsMenuProps) {
             onConfirm={gitActions.runBranch}
             isSubmitting={modals.isSubmitting}
             error={modals.branchError}
+          />
+
+          <StackSubmitDialog
+            open={modals.stackSubmitOpen}
+            onOpenChange={(open) => {
+              if (!open) modals.actions.closeStackSubmit();
+            }}
+            branchName={gitState.currentBranch}
+            draft={modals.stackSubmitDraft}
+            onDraftChange={modals.actions.setStackSubmitDraft}
+            onConfirm={gitActions.runStackSubmit}
+            isSubmitting={modals.isSubmitting}
+            error={modals.stackSubmitError}
+            stackPreview={
+              gitState.graphiteStack?.currentStack ? (
+                <StackVisualization
+                  entries={gitState.graphiteStack.currentStack}
+                />
+              ) : undefined
+            }
+          />
+
+          <StackSyncDialog
+            open={modals.stackSyncOpen}
+            onOpenChange={(open) => {
+              if (!open) modals.actions.closeStackSync();
+            }}
+            branchName={gitState.currentBranch}
+            onConfirm={gitActions.runStackSync}
+            isSubmitting={modals.isSubmitting}
+            error={modals.stackSyncError}
+          />
+
+          <StackModifyDialog
+            open={modals.stackModifyOpen}
+            onOpenChange={(open) => {
+              if (!open) modals.actions.closeStackModify();
+            }}
+            branchName={gitState.currentBranch}
+            onConfirm={gitActions.runStackModify}
+            isSubmitting={modals.isSubmitting}
+            error={modals.stackModifyError}
+          />
+
+          <StackCreateDialog
+            open={modals.stackCreateOpen}
+            onOpenChange={(open) => {
+              if (!open) modals.actions.closeStackCreate();
+            }}
+            message={modals.stackCreateMessage}
+            onMessageChange={modals.actions.setStackCreateMessage}
+            onConfirm={gitActions.runStackCreate}
+            isSubmitting={modals.isSubmitting}
+            error={modals.stackCreateError}
           />
         </>
       )}
@@ -434,6 +504,14 @@ function getGitActionIcon(actionId: GitMenuActionId) {
       return <Eye size={12} weight="bold" />;
     case "branch-here":
       return <GitFork size={12} weight="bold" />;
+    case "stack-submit":
+      return <GitPullRequest size={12} weight="bold" />;
+    case "stack-sync":
+      return <ArrowsClockwise size={12} weight="bold" />;
+    case "stack-create":
+      return <GitBranch size={12} weight="bold" />;
+    case "stack-modify":
+      return <GitCommit size={12} weight="bold" />;
     default:
       return <CloudArrowUp size={12} weight="bold" />;
   }

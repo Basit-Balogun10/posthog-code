@@ -1,5 +1,6 @@
 import { getAuthenticatedClient } from "@features/auth/hooks/authClient";
 import { useGitQueries } from "@features/git-interaction/hooks/useGitQueries";
+import { useGraphiteQueries } from "@features/git-interaction/hooks/useGraphiteQueries";
 import { computeGitInteractionState } from "@features/git-interaction/state/gitInteractionLogic";
 import {
   type GitInteractionStore,
@@ -58,6 +59,30 @@ interface GitInteractionState {
   isLoading: boolean;
   stagedFiles: ChangedFile[];
   unstagedFiles: ChangedFile[];
+  isGraphiteRepo: boolean;
+  graphiteStack: {
+    trunk: string;
+    entries: Array<{
+      branchName: string;
+      isCurrent: boolean;
+      isTrunk: boolean;
+      needsRestack: boolean;
+      prNumber: number | null;
+      prUrl: string | null;
+      prTitle: string | null;
+      prStatus: string | null;
+    }>;
+    currentStack: Array<{
+      branchName: string;
+      isCurrent: boolean;
+      isTrunk: boolean;
+      needsRestack: boolean;
+      prNumber: number | null;
+      prUrl: string | null;
+      prTitle: string | null;
+      prStatus: string | null;
+    }> | null;
+  } | null;
 }
 
 interface GitInteractionActions {
@@ -80,6 +105,10 @@ interface GitInteractionActions {
   closeCreatePr: () => void;
   setCreatePrBranchName: (value: string) => void;
   setCreatePrDraft: (value: boolean) => void;
+  runStackSubmit: () => Promise<void>;
+  runStackSync: () => Promise<void>;
+  runStackModify: () => Promise<void>;
+  runStackCreate: () => Promise<void>;
 }
 
 function buildStagingContext(
@@ -155,6 +184,7 @@ export function useGitInteraction(
   const pushAbortRef = useRef<AbortController | null>(null);
 
   const git = useGitQueries(repoPath);
+  const graphite = useGraphiteQueries(repoPath);
 
   const computed = useMemo(
     () =>
@@ -173,6 +203,7 @@ export function useGitInteraction(
         ghStatus: git.ghStatus ?? null,
         repoInfo: git.repoInfo ?? null,
         prStatus: git.prStatus ?? null,
+        isGraphiteRepo: graphite.isGraphiteRepo,
       }),
     [
       repoPath,
@@ -189,6 +220,7 @@ export function useGitInteraction(
       git.ghStatus,
       git.repoInfo,
       git.prStatus,
+      graphite.isGraphiteRepo,
     ],
   );
 
@@ -332,6 +364,10 @@ export function useGitInteraction(
       "create-pr": () => openCreatePr(),
       "branch-here": () =>
         modal.openBranch(getSuggestedBranchName(taskId, repoPath)),
+      "stack-submit": () => modal.openStackSubmit(),
+      "stack-sync": () => modal.openStackSync(),
+      "stack-modify": () => modal.openStackModify(),
+      "stack-create": () => modal.openStackCreate(),
     };
     actionMap[id]();
   };
@@ -603,6 +639,121 @@ export function useGitInteraction(
     }
   };
 
+  const runStackSubmit = async () => {
+    if (!repoPath) return;
+    modal.setIsSubmitting(true);
+    modal.setStackSubmitError(null);
+    try {
+      const result = await trpcClient.graphite.submit.mutate({
+        directoryPath: repoPath,
+        stack: true,
+        draft: store.stackSubmitDraft,
+      });
+      if (!result.success) {
+        modal.setStackSubmitError(result.error || "Submit failed.");
+        return;
+      }
+      track(ANALYTICS_EVENTS.GIT_ACTION_EXECUTED, {
+        action_type: "stack-submit",
+        success: true,
+        task_id: taskId,
+      });
+      modal.closeStackSubmit();
+    } catch (error) {
+      log.error("Stack submit failed", error);
+      modal.setStackSubmitError(
+        error instanceof Error ? error.message : "Submit failed.",
+      );
+    } finally {
+      modal.setIsSubmitting(false);
+    }
+  };
+
+  const runStackSync = async () => {
+    if (!repoPath) return;
+    modal.setIsSubmitting(true);
+    modal.setStackSyncError(null);
+    try {
+      const result = await trpcClient.graphite.sync.mutate({
+        directoryPath: repoPath,
+      });
+      if (!result.success) {
+        modal.setStackSyncError(result.error || "Sync failed.");
+        return;
+      }
+      track(ANALYTICS_EVENTS.GIT_ACTION_EXECUTED, {
+        action_type: "stack-sync",
+        success: true,
+        task_id: taskId,
+      });
+      modal.closeStackSync();
+    } catch (error) {
+      log.error("Stack sync failed", error);
+      modal.setStackSyncError(
+        error instanceof Error ? error.message : "Sync failed.",
+      );
+    } finally {
+      modal.setIsSubmitting(false);
+    }
+  };
+
+  const runStackModify = async () => {
+    if (!repoPath) return;
+    modal.setIsSubmitting(true);
+    modal.setStackModifyError(null);
+    try {
+      const result = await trpcClient.graphite.modify.mutate({
+        directoryPath: repoPath,
+      });
+      if (!result.success) {
+        modal.setStackModifyError(result.error || "Amend failed.");
+        return;
+      }
+      track(ANALYTICS_EVENTS.GIT_ACTION_EXECUTED, {
+        action_type: "stack-modify",
+        success: true,
+        task_id: taskId,
+      });
+      modal.closeStackModify();
+    } catch (error) {
+      log.error("Stack modify failed", error);
+      modal.setStackModifyError(
+        error instanceof Error ? error.message : "Amend failed.",
+      );
+    } finally {
+      modal.setIsSubmitting(false);
+    }
+  };
+
+  const runStackCreate = async () => {
+    if (!repoPath) return;
+    modal.setIsSubmitting(true);
+    modal.setStackCreateError(null);
+    try {
+      const result = await trpcClient.graphite.createBranch.mutate({
+        directoryPath: repoPath,
+        message: store.stackCreateMessage.trim() || undefined,
+      });
+      if (!result.success) {
+        modal.setStackCreateError(result.error || "Create branch failed.");
+        return;
+      }
+      track(ANALYTICS_EVENTS.GIT_ACTION_EXECUTED, {
+        action_type: "stack-create",
+        success: true,
+        task_id: taskId,
+      });
+      modal.closeStackCreate();
+    } catch (error) {
+      log.error("Stack create failed", error);
+      modal.setStackCreateError(
+        error instanceof Error ? error.message : "Create branch failed.",
+      );
+    } finally {
+      modal.setIsSubmitting(false);
+    }
+  };
+
   return {
     state: {
       primaryAction: computed.primaryAction,
@@ -621,6 +772,8 @@ export function useGitInteraction(
       isLoading: git.isLoading,
       stagedFiles,
       unstagedFiles,
+      isGraphiteRepo: graphite.isGraphiteRepo,
+      graphiteStack: graphite.stack,
     },
     modals: store,
     actions: {
@@ -650,6 +803,10 @@ export function useGitInteraction(
         modal.setBranchName(sanitized);
       },
       setCreatePrDraft: modal.setCreatePrDraft,
+      runStackSubmit,
+      runStackSync,
+      runStackModify,
+      runStackCreate,
     },
   };
 }

@@ -552,3 +552,205 @@ export function GitBranchDialog({
     </GitDialog>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Graphite stack dialogs
+// ---------------------------------------------------------------------------
+
+interface StackSubmitDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  branchName: string | null;
+  draft: boolean;
+  onDraftChange: (value: boolean) => void;
+  onConfirm: () => void;
+  isSubmitting: boolean;
+  error: string | null;
+  stackPreview?: ReactNode;
+}
+
+export function StackSubmitDialog({
+  open,
+  onOpenChange,
+  branchName,
+  draft,
+  onDraftChange,
+  onConfirm,
+  isSubmitting,
+  error,
+  stackPreview,
+}: StackSubmitDialogProps) {
+  return (
+    <GitDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      icon={<GitBranch size={ICON_SIZE} />}
+      title="Submit Stack"
+      error={error}
+      buttonLabel="Submit"
+      isSubmitting={isSubmitting}
+      onSubmit={onConfirm}
+    >
+      <InfoRow label="Branch">
+        <BranchBadge branch={branchName} />
+      </InfoRow>
+      <Text color="gray" className="text-[13px]">
+        Create or update pull requests for every branch in your stack.
+      </Text>
+      {stackPreview && (
+        <Box className="rounded-(--radius-2) border border-(--gray-5) p-2">
+          {stackPreview}
+        </Box>
+      )}
+      <Flex
+        align="center"
+        gap="2"
+        py="1"
+        onClick={() => onDraftChange(!draft)}
+        className="cursor-pointer"
+      >
+        <Checkbox
+          size="1"
+          checked={draft}
+          onCheckedChange={(c) => onDraftChange(c === true)}
+          onClick={(e) => e.stopPropagation()}
+        />
+        <Text color="gray" className="text-[13px]">
+          Submit as draft
+        </Text>
+      </Flex>
+    </GitDialog>
+  );
+}
+
+interface StackSyncDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  branchName: string | null;
+  onConfirm: () => void;
+  isSubmitting: boolean;
+  error: string | null;
+}
+
+export function StackSyncDialog({
+  open,
+  onOpenChange,
+  branchName,
+  onConfirm,
+  isSubmitting,
+  error,
+}: StackSyncDialogProps) {
+  return (
+    <GitDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      icon={<CloudArrowUp size={ICON_SIZE} />}
+      title="Sync Stack"
+      error={error}
+      buttonLabel="Sync"
+      isSubmitting={isSubmitting}
+      onSubmit={onConfirm}
+    >
+      <InfoRow label="Branch">
+        <BranchBadge branch={branchName} />
+      </InfoRow>
+      <Text color="gray" className="text-[13px]">
+        Pull the latest changes from the remote and rebase your stack on top.
+      </Text>
+    </GitDialog>
+  );
+}
+
+interface StackModifyDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  branchName: string | null;
+  onConfirm: () => void;
+  isSubmitting: boolean;
+  error: string | null;
+}
+
+export function StackModifyDialog({
+  open,
+  onOpenChange,
+  branchName,
+  onConfirm,
+  isSubmitting,
+  error,
+}: StackModifyDialogProps) {
+  return (
+    <GitDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      icon={<GitCommit size={ICON_SIZE} />}
+      title="Amend Branch"
+      error={error}
+      buttonLabel="Amend"
+      isSubmitting={isSubmitting}
+      onSubmit={onConfirm}
+    >
+      <InfoRow label="Branch">
+        <BranchBadge branch={branchName} />
+      </InfoRow>
+      <Text color="gray" className="text-[13px]">
+        Amend all staged and unstaged changes into the current stack branch.
+      </Text>
+    </GitDialog>
+  );
+}
+
+interface StackCreateDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  message: string;
+  onMessageChange: (value: string) => void;
+  onConfirm: () => void;
+  isSubmitting: boolean;
+  error: string | null;
+}
+
+export function StackCreateDialog({
+  open,
+  onOpenChange,
+  message,
+  onMessageChange,
+  onConfirm,
+  isSubmitting,
+  error,
+}: StackCreateDialogProps) {
+  return (
+    <GitDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      icon={<GitFork size={ICON_SIZE} />}
+      title="Stack Branch"
+      error={error}
+      buttonLabel="Create"
+      isSubmitting={isSubmitting}
+      onSubmit={onConfirm}
+    >
+      <Text color="gray" className="text-[13px]">
+        Create a new branch on top of the current stack and commit all changes.
+      </Text>
+      <Flex direction="column" gap="1">
+        <Text color="gray" className="text-[13px]">
+          Commit message (optional)
+        </Text>
+        <TextArea
+          value={message}
+          onChange={(e) => onMessageChange(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              if (!isSubmitting) onConfirm();
+            }
+          }}
+          placeholder="Leave empty to auto-generate"
+          size="1"
+          rows={1}
+          autoFocus
+        />
+      </Flex>
+    </GitDialog>
+  );
+}

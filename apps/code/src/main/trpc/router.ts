@@ -16,6 +16,7 @@ import { focusRouter } from "./routers/focus";
 import { foldersRouter } from "./routers/folders";
 import { fsRouter } from "./routers/fs";
 import { gitRouter } from "./routers/git";
+import { graphiteRouter } from "./routers/graphite";
 import { githubIntegrationRouter } from "./routers/github-integration";
 import { handoffRouter } from "./routers/handoff";
 import { linearIntegrationRouter } from "./routers/linear-integration.js";
@@ -58,6 +59,7 @@ export const trpcRouter = router({
   folders: foldersRouter,
   fs: fsRouter,
   git: gitRouter,
+  graphite: graphiteRouter,
   githubIntegration: githubIntegrationRouter,
   handoff: handoffRouter,
   linearIntegration: linearIntegrationRouter,

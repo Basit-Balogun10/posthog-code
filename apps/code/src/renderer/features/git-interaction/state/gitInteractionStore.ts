@@ -46,6 +46,18 @@ interface GitInteractionState {
   commitAll: boolean;
   createPrDrafts: Record<string, CreatePrDraftValues>;
   activeCreatePrDraftKey: string | null;
+
+  // Graphite stack dialogs
+  stackSubmitOpen: boolean;
+  stackSubmitDraft: boolean;
+  stackSubmitError: string | null;
+  stackSyncOpen: boolean;
+  stackSyncError: string | null;
+  stackModifyOpen: boolean;
+  stackModifyError: string | null;
+  stackCreateOpen: boolean;
+  stackCreateMessage: string;
+  stackCreateError: string | null;
 }
 
 interface GitInteractionActions {
@@ -86,6 +98,22 @@ interface GitInteractionActions {
   closeCommit: () => void;
   closePush: () => void;
   closeBranch: () => void;
+
+  // Graphite stack actions
+  openStackSubmit: () => void;
+  closeStackSubmit: () => void;
+  setStackSubmitDraft: (value: boolean) => void;
+  setStackSubmitError: (value: string | null) => void;
+  openStackSync: () => void;
+  closeStackSync: () => void;
+  setStackSyncError: (value: string | null) => void;
+  openStackModify: () => void;
+  closeStackModify: () => void;
+  setStackModifyError: (value: string | null) => void;
+  openStackCreate: () => void;
+  closeStackCreate: () => void;
+  setStackCreateMessage: (value: string) => void;
+  setStackCreateError: (value: string | null) => void;
 }
 
 export interface GitInteractionStore extends GitInteractionState {
@@ -120,6 +148,17 @@ const initialState: GitInteractionState = {
   commitAll: true,
   createPrDrafts: {},
   activeCreatePrDraftKey: null,
+
+  stackSubmitOpen: false,
+  stackSubmitDraft: false,
+  stackSubmitError: null,
+  stackSyncOpen: false,
+  stackSyncError: null,
+  stackModifyOpen: false,
+  stackModifyError: null,
+  stackCreateOpen: false,
+  stackCreateMessage: "",
+  stackCreateError: null,
 };
 
 function draftHasContent(draft: CreatePrDraftValues): boolean {
@@ -254,6 +293,41 @@ export const useGitInteractionStore = create<GitInteractionStore>()(
           }),
         closeBranch: () =>
           set({ branchOpen: false, branchError: null, branchName: "" }),
+
+        openStackSubmit: () =>
+          set({
+            stackSubmitOpen: true,
+            stackSubmitDraft: false,
+            stackSubmitError: null,
+          }),
+        closeStackSubmit: () =>
+          set({ stackSubmitOpen: false, stackSubmitError: null }),
+        setStackSubmitDraft: (value) => set({ stackSubmitDraft: value }),
+        setStackSubmitError: (value) => set({ stackSubmitError: value }),
+        openStackSync: () =>
+          set({ stackSyncOpen: true, stackSyncError: null }),
+        closeStackSync: () =>
+          set({ stackSyncOpen: false, stackSyncError: null }),
+        setStackSyncError: (value) => set({ stackSyncError: value }),
+        openStackModify: () =>
+          set({ stackModifyOpen: true, stackModifyError: null }),
+        closeStackModify: () =>
+          set({ stackModifyOpen: false, stackModifyError: null }),
+        setStackModifyError: (value) => set({ stackModifyError: value }),
+        openStackCreate: () =>
+          set({
+            stackCreateOpen: true,
+            stackCreateMessage: "",
+            stackCreateError: null,
+          }),
+        closeStackCreate: () =>
+          set({
+            stackCreateOpen: false,
+            stackCreateError: null,
+            stackCreateMessage: "",
+          }),
+        setStackCreateMessage: (value) => set({ stackCreateMessage: value }),
+        setStackCreateError: (value) => set({ stackCreateError: value }),
       },
     }),
     {
@@ -282,6 +356,14 @@ export function getGitInteractionActionLabel(
       return "View PR";
     case "branch-here":
       return "New branch";
+    case "stack-submit":
+      return "Submit Stack";
+    case "stack-sync":
+      return "Sync";
+    case "stack-create":
+      return "Stack Branch";
+    case "stack-modify":
+      return "Amend";
     default:
       return "Git Action";
   }
