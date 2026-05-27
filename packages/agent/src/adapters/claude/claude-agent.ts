@@ -76,6 +76,10 @@ import {
   handleUserAssistantMessage,
 } from "./conversion/sdk-to-acp";
 import type { EnrichedReadCache } from "./hooks";
+import {
+  createGraphiteMcpServer,
+  GRAPHITE_MCP_NAME,
+} from "./mcp/graphite";
 import { createLocalToolsMcpServer } from "./mcp/local-tools";
 import {
   fetchMcpToolMetadata,
@@ -1142,6 +1146,16 @@ export class ClaudeAcpAgent extends BaseAcpAgent {
       this.logger.warn(
         "Cloud run registered no local tools — missing GH_TOKEN/GITHUB_TOKEN? signed commits unavailable",
       );
+    }
+
+    // Auto-register `gt mcp` when the project is a Graphite-tracked repo so
+    // the agent can create and manage stacked PRs without any user config.
+    if (cwd) {
+      const graphiteServer = await createGraphiteMcpServer(cwd);
+      if (graphiteServer) {
+        mcpServers[GRAPHITE_MCP_NAME] = graphiteServer;
+        this.logger.info("Detected Graphite repo — registered gt mcp server");
+      }
     }
 
     const systemPrompt = buildSystemPrompt(meta?.systemPrompt);

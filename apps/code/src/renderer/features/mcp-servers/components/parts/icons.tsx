@@ -17,6 +17,7 @@ import IconFigma from "@renderer/assets/services/figma.svg";
 import IconFiretiger from "@renderer/assets/services/firetiger.svg";
 import IconGitHub from "@renderer/assets/services/github.svg";
 import IconGitLab from "@renderer/assets/services/gitlab.svg";
+import IconGraphite from "@renderer/assets/services/graphite.svg";
 import IconHex from "@renderer/assets/services/hex.svg";
 import IconHubSpot from "@renderer/assets/services/hubspot.svg";
 import IconLaunchDarkly from "@renderer/assets/services/launchdarkly.png";
@@ -55,6 +56,7 @@ const BRAND_ICONS: Record<string, string> = {
   firetiger: IconFiretiger,
   github: IconGitHub,
   gitlab: IconGitLab,
+  graphite: IconGraphite,
   hex: IconHex,
   hubspot: IconHubSpot,
   launchdarkly: IconLaunchDarkly,
