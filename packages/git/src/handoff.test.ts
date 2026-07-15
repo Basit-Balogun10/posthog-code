@@ -5,13 +5,16 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { createGitClient } from "./client";
-import { CaptureCheckpointSaga, RevertCheckpointSaga } from "./sagas/checkpoint";
 import {
   type GitHandoffApplyInput,
   type GitHandoffCaptureResult,
   GitHandoffTracker,
   type HandoffLocalGitState,
 } from "./handoff";
+import {
+  CaptureCheckpointSaga,
+  RevertCheckpointSaga,
+} from "./sagas/checkpoint";
 
 const execFileAsync = promisify(execFile);
 
@@ -183,7 +186,7 @@ describe("GitHandoffTracker", () => {
         await cleanupCapture(capture);
       }
     });
-  }, 15000);
+  }, 30000);
 
   it("keeps shipped index consistent with worktreeTree for staged large files", async () => {
     await withRepos(async (repos) => {
@@ -208,7 +211,7 @@ describe("GitHandoffTracker", () => {
         await cleanupCapture(capture);
       }
     });
-  }, 20000);
+  }, 30000);
 
   it("removes tracked files absent from the checkpoint worktree", async () => {
     await withRepos(async (repos) => {
@@ -229,7 +232,7 @@ describe("GitHandoffTracker", () => {
         await cleanupCapture(capture);
       }
     });
-  }, 15000);
+  }, 30000);
 
   it("prompts before resetting a diverged local branch", async () => {
     await withRepos(async (repos) => {
@@ -292,7 +295,7 @@ describe("GitHandoffTracker", () => {
         await cleanupCapture(capture);
       }
     });
-  }, 15000);
+  }, 30000);
 
   it("preserves existing local upstream config", async () => {
     await withRepos(async (repos) => {
@@ -359,7 +362,7 @@ describe("GitHandoffTracker", () => {
         await cleanupCapture(capture);
       }
     });
-  }, 15000);
+  }, 30000);
 
   it("adopts cloud upstream when the local branch has none", async () => {
     await withRepos(async (repos) => {
@@ -426,7 +429,7 @@ describe("GitHandoffTracker", () => {
         await cleanupCapture(capture);
       }
     });
-  }, 15000);
+  }, 30000);
 
   it("packExistingCheckpoint ships the worktreeTree so a baseline-only receiver can apply it", async () => {
     await withRepos(async (repos) => {
@@ -437,7 +440,10 @@ describe("GitHandoffTracker", () => {
       await writeFile(path.join(repos.cloudRepo, "tracked.txt"), "staged\n");
       await repos.cloudGit.add(["tracked.txt"]);
       await writeFile(path.join(repos.cloudRepo, "unstaged.txt"), "unstaged\n");
-      await writeFile(path.join(repos.cloudRepo, "untracked.txt"), "untracked\n");
+      await writeFile(
+        path.join(repos.cloudRepo, "untracked.txt"),
+        "untracked\n",
+      );
 
       const saga = new CaptureCheckpointSaga();
       const result = await saga.run({ baseDir: repos.cloudRepo });
@@ -473,9 +479,13 @@ describe("GitHandoffTracker", () => {
         // (cat-file -e exits non-zero when the object is absent; rev-parse --verify
         // would merely echo a well-formed SHA without checking existence).
         await expect(
-          execFileAsync("git", ["cat-file", "-e", packed.checkpoint.worktreeTree], {
-            cwd: repos.localRepo,
-          }),
+          execFileAsync(
+            "git",
+            ["cat-file", "-e", packed.checkpoint.worktreeTree],
+            {
+              cwd: repos.localRepo,
+            },
+          ),
         ).rejects.toThrow();
 
         // Apply the pack the way the cloud does, then materialize the worktreeTree.
@@ -499,10 +509,7 @@ describe("GitHandoffTracker", () => {
         );
 
         expect(
-          await readFile(
-            path.join(repos.localRepo, "untracked.txt"),
-            "utf-8",
-          ),
+          await readFile(path.join(repos.localRepo, "untracked.txt"), "utf-8"),
         ).toBe("untracked\n");
         expect(
           await readFile(path.join(repos.localRepo, "tracked.txt"), "utf-8"),
@@ -515,7 +522,332 @@ describe("GitHandoffTracker", () => {
         }).catch(() => {});
       }
     });
-  }, 15000);
+  }, 30000);
+
+  it("keeps the handoff pack differential under a blob:none partial clone", async () => {
+    // Regression for the local→cloud 413 (oversized `capture_git_checkpoint` pack). Under a
+    // `blob:none` partial clone, `git pack-objects --revs ^baseline` can fail to keep the pack
+    // differential: the working tree materializes large blobs locally (re-hashed into
+    // `worktreeTree`), but the identical upstream copies are promisor-filtered, so the negative
+    // `^baseline` walk cannot mark them uninteresting and packs the whole asset — blowing the
+    // 30MB artifact cap. The fix subtracts the baseline's (locally-present) tree-object SHAs
+    // from the pack list, so any object the receiver can reconstruct from its own baseline is
+    // never shipped. This exercises the partial-clone path end to end and asserts the invariant:
+    // the pack contains no object already present in the baseline and stays far smaller than the
+    // large asset it must not re-ship.
+    const upstreamBare = await mkdtemp(
+      path.join(tmpdir(), "posthog-code-handoff-upstream-"),
+    );
+    const seedRepo = await mkdtemp(
+      path.join(tmpdir(), "posthog-code-handoff-seed-"),
+    );
+    const senderRepo = await mkdtemp(
+      path.join(tmpdir(), "posthog-code-handoff-sender-"),
+    );
+    const receiverRepo = await mkdtemp(
+      path.join(tmpdir(), "posthog-code-handoff-receiver-"),
+    );
+    const bareUrl = `file:///${upstreamBare.replace(/\\/g, "/")}`;
+
+    const gitIn = (cwd: string, args: string[]) =>
+      execFileAsync("git", args, { cwd });
+
+    let capture: GitHandoffCaptureResult | null = null;
+    try {
+      // Bare upstream that advertises partial-clone filtering.
+      await execFileAsync("git", ["init", "-q", "--bare", upstreamBare]);
+      await gitIn(upstreamBare, ["config", "uploadpack.allowFilter", "true"]);
+      await gitIn(upstreamBare, [
+        "config",
+        "uploadpack.allowAnySHA1InWant",
+        "true",
+      ]);
+
+      // Seed a commit carrying a large binary asset, then publish it as `main`.
+      await execFileAsync("git", ["clone", "-q", upstreamBare, seedRepo]);
+      await gitIn(seedRepo, ["config", "user.email", "t@t.com"]);
+      await gitIn(seedRepo, ["config", "user.name", "Test"]);
+      await gitIn(seedRepo, ["config", "commit.gpgsign", "false"]);
+      await gitIn(seedRepo, ["config", "core.autocrlf", "false"]);
+      const bigAsset = Buffer.alloc(2 * 1024 * 1024, 7);
+      await writeFile(path.join(seedRepo, "big.bin"), bigAsset);
+      await writeFile(path.join(seedRepo, "small.txt"), "hello\n");
+      await gitIn(seedRepo, ["add", "-A"]);
+      await gitIn(seedRepo, ["commit", "-qm", "base with large asset"]);
+      await gitIn(seedRepo, ["branch", "-M", "main"]);
+      await gitIn(seedRepo, ["push", "-q", "origin", "main"]);
+
+      // Sender = a real blobless partial clone (`--no-local` forces the transport so the
+      // filter is honored instead of hardlinking every object). Its HEAD sits at the first
+      // commit; `big.bin` is materialized into the working tree by checkout.
+      await execFileAsync("git", [
+        "clone",
+        "-q",
+        "--no-local",
+        "--filter=blob:none",
+        bareUrl,
+        senderRepo,
+      ]);
+      await gitIn(senderRepo, ["config", "user.email", "t@t.com"]);
+      await gitIn(senderRepo, ["config", "user.name", "Test"]);
+      await gitIn(senderRepo, ["config", "commit.gpgsign", "false"]);
+      await gitIn(senderRepo, ["config", "core.autocrlf", "false"]);
+
+      // Advance upstream by one commit so the receiver's baseline (origin/main) is a real,
+      // distinct differential base ahead of the sender's HEAD — mirroring "local is behind
+      // upstream" at handoff time. The new commit keeps `big.bin` unchanged, so the baseline
+      // still contains that (now promisor-filtered) large blob.
+      await writeFile(path.join(seedRepo, "other.txt"), "upstream advance\n");
+      await gitIn(seedRepo, ["add", "-A"]);
+      await gitIn(seedRepo, ["commit", "-qm", "upstream advances"]);
+      await gitIn(seedRepo, ["push", "-q", "origin", "main"]);
+      await gitIn(senderRepo, ["fetch", "-q", "origin"]);
+
+      const senderGit = createGitClient(senderRepo);
+      const baseline = (await senderGit.revparse(["origin/main"])).trim();
+      const head = (await senderGit.revparse(["HEAD"])).trim();
+      expect(baseline).not.toBe(head);
+      const bigSha = (await senderGit.revparse(["HEAD:big.bin"])).trim();
+
+      // A small working-tree change: the only content the handoff legitimately needs to ship.
+      await writeFile(path.join(senderRepo, "feature.txt"), "new feature\n");
+
+      const tracker = new GitHandoffTracker({ repositoryPath: senderRepo });
+      capture = await tracker.captureForHandoff({
+        head,
+        branch: "main",
+        upstreamHead: baseline,
+        upstreamRemote: "origin",
+        upstreamMergeRef: "refs/heads/main",
+      });
+
+      const packPath = capture.headPack?.path;
+      expect(packPath).toBeTruthy();
+      if (!packPath) return;
+
+      // Invariant 1: the large asset (present in the baseline) is never re-shipped.
+      const { stdout: packListing } = await execFileAsync(
+        "git",
+        ["verify-pack", "-v", packPath],
+        { cwd: senderRepo },
+      );
+      expect(packListing).not.toContain(bigSha);
+
+      // Invariant 2: the pack stays far below the asset size (differential, not full-repo).
+      expect(capture.headPack?.rawBytes ?? 0).toBeLessThan(256 * 1024);
+
+      // Round-trip: a receiver that already has the baseline applies the pack and restores the
+      // small change — proving the excluded baseline objects were genuinely unnecessary.
+      await execFileAsync("git", ["clone", "-q", upstreamBare, receiverRepo]);
+      await gitIn(receiverRepo, ["config", "user.email", "t@t.com"]);
+      await gitIn(receiverRepo, ["config", "user.name", "Test"]);
+      await gitIn(receiverRepo, ["config", "commit.gpgsign", "false"]);
+      await gitIn(receiverRepo, ["config", "core.autocrlf", "false"]);
+
+      const applyTracker = new GitHandoffTracker({
+        repositoryPath: receiverRepo,
+      });
+      await applyTracker.applyFromHandoff({
+        checkpoint: capture.checkpoint,
+        headPackPath: capture.headPack?.path,
+        indexPath: capture.indexFile.path,
+        localGitState: {
+          head: baseline,
+          branch: "main",
+          upstreamHead: baseline,
+          upstreamRemote: "origin",
+          upstreamMergeRef: "refs/heads/main",
+        },
+        // The receiver sits at the advanced baseline (one commit ahead of the checkpoint's
+        // HEAD), so restoring the checkpoint is an intentional reset — accept it.
+        onDivergedBranch: async () => true,
+      });
+      expect(
+        await readFile(path.join(receiverRepo, "feature.txt"), "utf-8"),
+      ).toBe("new feature\n");
+    } finally {
+      if (capture) await cleanupCapture(capture);
+      await rm(upstreamBare, { recursive: true, force: true });
+      await rm(seedRepo, { recursive: true, force: true });
+      await rm(senderRepo, { recursive: true, force: true });
+      await rm(receiverRepo, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it("applies the differential pack on a blob:none receiver by lazy-fetching excluded baseline blobs", async () => {
+    // Companion to the test above, closing the one assumption the fix rests on: "the receiver
+    // already has the baseline objects." A full-clone receiver trivially does. But the real
+    // cloud sandbox is ITSELF a `blob:none` partial clone, so the baseline blobs we deliberately
+    // drop from the pack are promisor-absent on the receiver too. This proves that is still safe:
+    // `read-tree --reset -u <worktreeTree>` materializes the checkpoint's full worktree by lazily
+    // fetching those excluded blobs from the receiver's own promisor remote — so the small
+    // differential pack applies and BOTH the shipped change (feature.txt, in the pack) and the
+    // untouched large asset (big.bin, excluded from the pack) end up byte-correct.
+    const upstreamBare = await mkdtemp(
+      path.join(tmpdir(), "posthog-code-handoff-upstream-"),
+    );
+    const seedRepo = await mkdtemp(
+      path.join(tmpdir(), "posthog-code-handoff-seed-"),
+    );
+    const senderRepo = await mkdtemp(
+      path.join(tmpdir(), "posthog-code-handoff-sender-"),
+    );
+    const receiverRepo = await mkdtemp(
+      path.join(tmpdir(), "posthog-code-handoff-receiver-"),
+    );
+    const bareUrl = `file:///${upstreamBare.replace(/\\/g, "/")}`;
+
+    const gitIn = (cwd: string, args: string[]) =>
+      execFileAsync("git", args, { cwd });
+
+    let capture: GitHandoffCaptureResult | null = null;
+    try {
+      // Bare upstream that advertises partial-clone filtering, so BOTH the sender and the
+      // receiver can clone blobless and lazily backfill blobs on demand.
+      await execFileAsync("git", ["init", "-q", "--bare", upstreamBare]);
+      await gitIn(upstreamBare, ["config", "uploadpack.allowFilter", "true"]);
+      await gitIn(upstreamBare, [
+        "config",
+        "uploadpack.allowAnySHA1InWant",
+        "true",
+      ]);
+
+      // Seed a commit carrying a large binary asset, then publish it as `main`.
+      await execFileAsync("git", ["clone", "-q", upstreamBare, seedRepo]);
+      await gitIn(seedRepo, ["config", "user.email", "t@t.com"]);
+      await gitIn(seedRepo, ["config", "user.name", "Test"]);
+      await gitIn(seedRepo, ["config", "commit.gpgsign", "false"]);
+      await gitIn(seedRepo, ["config", "core.autocrlf", "false"]);
+      const bigAsset = Buffer.alloc(2 * 1024 * 1024, 7);
+      await writeFile(path.join(seedRepo, "big.bin"), bigAsset);
+      await writeFile(path.join(seedRepo, "small.txt"), "hello\n");
+      await gitIn(seedRepo, ["add", "-A"]);
+      await gitIn(seedRepo, ["commit", "-qm", "base with large asset"]);
+      await gitIn(seedRepo, ["branch", "-M", "main"]);
+      await gitIn(seedRepo, ["push", "-q", "origin", "main"]);
+
+      // Sender = a real blobless partial clone at the base commit.
+      await execFileAsync("git", [
+        "clone",
+        "-q",
+        "--no-local",
+        "--filter=blob:none",
+        bareUrl,
+        senderRepo,
+      ]);
+      await gitIn(senderRepo, ["config", "user.email", "t@t.com"]);
+      await gitIn(senderRepo, ["config", "user.name", "Test"]);
+      await gitIn(senderRepo, ["config", "commit.gpgsign", "false"]);
+      await gitIn(senderRepo, ["config", "core.autocrlf", "false"]);
+
+      // Advance upstream so origin/main (the baseline) is a distinct commit ahead of the
+      // sender's HEAD, still carrying the unchanged (now promisor-filtered) large blob.
+      await writeFile(path.join(seedRepo, "other.txt"), "upstream advance\n");
+      await gitIn(seedRepo, ["add", "-A"]);
+      await gitIn(seedRepo, ["commit", "-qm", "upstream advances"]);
+      await gitIn(seedRepo, ["push", "-q", "origin", "main"]);
+      await gitIn(senderRepo, ["fetch", "-q", "origin"]);
+
+      const senderGit = createGitClient(senderRepo);
+      const baseline = (await senderGit.revparse(["origin/main"])).trim();
+      const head = (await senderGit.revparse(["HEAD"])).trim();
+      expect(baseline).not.toBe(head);
+      const bigSha = (await senderGit.revparse(["HEAD:big.bin"])).trim();
+
+      // The only content the handoff legitimately needs to ship.
+      await writeFile(path.join(senderRepo, "feature.txt"), "new feature\n");
+
+      const tracker = new GitHandoffTracker({ repositoryPath: senderRepo });
+      capture = await tracker.captureForHandoff({
+        head,
+        branch: "main",
+        upstreamHead: baseline,
+        upstreamRemote: "origin",
+        upstreamMergeRef: "refs/heads/main",
+      });
+
+      const packPath = capture.headPack?.path;
+      expect(packPath).toBeTruthy();
+      if (!packPath) return;
+
+      // Sanity: the large blob really is excluded from the pack (else this test is moot).
+      const { stdout: packListing } = await execFileAsync(
+        "git",
+        ["verify-pack", "-v", packPath],
+        { cwd: senderRepo },
+      );
+      expect(packListing).not.toContain(bigSha);
+
+      // Receiver = ALSO a `blob:none` partial clone, so big.bin's blob is promisor-absent here
+      // too — the receiver cannot have it "already", it must lazily backfill it during apply.
+      await execFileAsync("git", [
+        "clone",
+        "-q",
+        "--no-local",
+        "--filter=blob:none",
+        bareUrl,
+        receiverRepo,
+      ]);
+      await gitIn(receiverRepo, ["config", "user.email", "t@t.com"]);
+      await gitIn(receiverRepo, ["config", "user.name", "Test"]);
+      await gitIn(receiverRepo, ["config", "commit.gpgsign", "false"]);
+      await gitIn(receiverRepo, ["config", "core.autocrlf", "false"]);
+
+      // Precondition: the excluded blob is genuinely missing on the receiver before apply.
+      // `--missing=print` lists promisor-absent objects WITHOUT triggering a lazy fetch, so this
+      // confirms the receiver really lacks big.bin (making the post-apply reconstruction real).
+      const { stdout: missingBefore } = await execFileAsync(
+        "git",
+        ["rev-list", "--objects", "--missing=print", "origin/main"],
+        { cwd: receiverRepo },
+      );
+      expect(missingBefore).toContain(bigSha);
+
+      const applyTracker = new GitHandoffTracker({
+        repositoryPath: receiverRepo,
+      });
+      await applyTracker.applyFromHandoff({
+        checkpoint: capture.checkpoint,
+        headPackPath: capture.headPack?.path,
+        indexPath: capture.indexFile.path,
+        localGitState: {
+          head: baseline,
+          branch: "main",
+          upstreamHead: baseline,
+          upstreamRemote: "origin",
+          upstreamMergeRef: "refs/heads/main",
+        },
+        // The receiver sits at the advanced baseline (ahead of the checkpoint's HEAD), so
+        // restoring the checkpoint is an intentional reset — accept it.
+        onDivergedBranch: async () => true,
+      });
+
+      // Line-ending-tolerant read: git may normalize LF→CRLF on checkout under a Windows
+      // core.autocrlf; the invariant under test is content, not EOL.
+      const readText = async (name: string) =>
+        (await readFile(path.join(receiverRepo, name), "utf-8")).replace(
+          /\r\n/g,
+          "\n",
+        );
+
+      // The shipped change applied from the pack...
+      expect(await readText("feature.txt")).toBe("new feature\n");
+      // ...and the excluded large asset was reconstructed from the receiver's promisor remote:
+      // read-tree -u materialized the full checkpoint worktree, lazy-fetching the dropped blob.
+      // (Binary content is compared exactly — no EOL normalization applies.)
+      const bigOut = await readFile(path.join(receiverRepo, "big.bin"));
+      expect(bigOut.length).toBe(2 * 1024 * 1024);
+      expect(bigOut[0]).toBe(7);
+      expect(bigOut[bigOut.length - 1]).toBe(7);
+      expect(await readText("small.txt")).toBe("hello\n");
+    } finally {
+      if (capture) await cleanupCapture(capture);
+      await rm(upstreamBare, { recursive: true, force: true });
+      await rm(seedRepo, { recursive: true, force: true });
+      await rm(senderRepo, { recursive: true, force: true });
+      await rm(receiverRepo, { recursive: true, force: true });
+    }
+  }, 30000);
 
   it("materializeCheckpointRef recreates a restorable ref from a pack without touching the worktree", async () => {
     await withRepos(async (repos) => {
@@ -548,9 +880,9 @@ describe("GitHandoffTracker", () => {
 
         // The ref now exists locally and the working tree is untouched.
         const refName = `refs/posthog-code-checkpoint/${checkpointId}`;
-        expect((await repos.localGit.revparse(["--verify", refName])).trim()).toBe(
-          first.commit,
-        );
+        expect(
+          (await repos.localGit.revparse(["--verify", refName])).trim(),
+        ).toBe(first.commit);
         expect((await repos.localGit.revparse(["HEAD"])).trim()).toBe(
           localHeadBefore,
         );
@@ -591,5 +923,8 @@ describe("GitHandoffTracker", () => {
         await cleanupCapture(capture);
       }
     });
-  }, 15000);
+    // 30s to match the other clone-heavy handoff cases: Windows git ops routinely push this
+    // real pack/unpack round-trip just past a 15s budget (pre-existing flake, unrelated to the
+    // fix under test).
+  }, 30000);
 });

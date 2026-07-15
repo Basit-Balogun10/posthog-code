@@ -34,6 +34,14 @@ function createService(overrides: {
     ...overrides.logs,
   };
 
+  const loggerFactory = {
+    scope: () => ({
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    }),
+  };
   const service = new HandoffHostService(
     {} as never,
     {} as never,
@@ -43,6 +51,7 @@ function createService(overrides: {
     {} as never,
     git as never,
     logs as never,
+    loggerFactory as never,
   );
   return { service, workspaceRepo, repositoryRepo, git, logs };
 }

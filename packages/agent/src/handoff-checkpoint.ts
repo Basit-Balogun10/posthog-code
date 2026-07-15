@@ -6,6 +6,7 @@ import {
   type GitHandoffCheckpoint,
   GitHandoffTracker,
 } from "@posthog/git/handoff";
+import type { SagaLogger } from "@posthog/shared";
 import type { PostHogAPIClient } from "./posthog-api";
 import type { GitCheckpoint, HandoffLocalGitState } from "./types";
 import { Logger } from "./utils/logger";
@@ -15,7 +16,10 @@ export interface HandoffCheckpointTrackerConfig {
   taskId: string;
   runId: string;
   apiClient?: PostHogAPIClient;
-  logger?: Logger;
+  // Structural logger so callers can inject their own scoped logger (e.g. an
+  // electron-log-backed one) instead of the default console Logger, which drops
+  // everything below `error`. Both satisfy SagaLogger.
+  logger?: SagaLogger;
 }
 
 type ArtifactTransfer<T extends object = Record<string, never>> = T & {
@@ -53,7 +57,7 @@ export class HandoffCheckpointTracker {
   private taskId: string;
   private runId: string;
   private apiClient?: PostHogAPIClient;
-  private logger: Logger;
+  private logger: SagaLogger;
 
   constructor(config: HandoffCheckpointTrackerConfig) {
     this.repositoryPath = config.repositoryPath;

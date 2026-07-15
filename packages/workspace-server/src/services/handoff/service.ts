@@ -32,7 +32,12 @@ import type { IRepositoryRepository } from "../../db/repositories/repository-rep
 import type { IWorkspaceRepository } from "../../db/repositories/workspace-repository";
 import type { AgentService } from "../agent/agent";
 import type { AgentAuthAdapter } from "../agent/auth-adapter";
-import { AGENT_AUTH_ADAPTER, AGENT_SERVICE } from "../agent/identifiers";
+import {
+  AGENT_AUTH_ADAPTER,
+  AGENT_LOGGER,
+  AGENT_SERVICE,
+} from "../agent/identifiers";
+import type { AgentLogger } from "../agent/ports";
 import { HANDOFF_GIT_GATEWAY, HANDOFF_LOG_GATEWAY } from "./identifiers";
 import type { HandoffGitGateway, HandoffLogGateway } from "./ports";
 
@@ -64,6 +69,8 @@ export class HandoffHostService implements HandoffHost {
     private readonly git: HandoffGitGateway,
     @inject(HANDOFF_LOG_GATEWAY)
     private readonly logs: HandoffLogGateway,
+    @inject(AGENT_LOGGER)
+    private readonly loggerFactory: AgentLogger,
   ) {}
 
   getChangedFiles(repoPath: string): Promise<readonly HandoffChangedFile[]> {
@@ -120,6 +127,7 @@ export class HandoffHostService implements HandoffHost {
       taskId,
       runId,
       apiClient,
+      logger: this.loggerFactory.scope("handoff"),
     });
     await tracker.applyFromHandoff(checkpoint, {
       localGitState,
@@ -219,6 +227,7 @@ export class HandoffHostService implements HandoffHost {
       taskId,
       runId,
       apiClient,
+      logger: this.loggerFactory.scope("handoff"),
     });
 
     for (const event of checkpointEvents) {
@@ -279,6 +288,7 @@ export class HandoffHostService implements HandoffHost {
       taskId,
       runId,
       apiClient,
+      logger: this.loggerFactory.scope("handoff"),
     });
     const checkpoint = await tracker.captureForHandoff(localGitState);
     if (!checkpoint) return null;
@@ -331,6 +341,7 @@ export class HandoffHostService implements HandoffHost {
       taskId,
       runId,
       apiClient,
+      logger: this.loggerFactory.scope("handoff"),
     });
 
     const checkpoints = await tracker.packAndUploadLocalCheckpoints(

@@ -123,23 +123,30 @@ export class GitHandoffTracker {
       // packs only objects unique to HEAD's ancestry, which is exactly what the receiver
       // lacks. A correct full pack is always safer than a tiny broken one, so when no valid
       // baseline is found we fall back to null.
-      const packBaselineRaw =
-        localGitState?.upstreamHead ??
-        (await this.resolveUpstreamBaseline(git, checkpoint.branch));
-      // Only exclude the baseline as a negative ref if it exists locally (otherwise
-      // pack-objects fails with "fatal: bad object") and is not identical to HEAD
-      // (which would produce an empty pack).
-      const packBaseline =
-        packBaselineRaw &&
-        packBaselineRaw !== checkpoint.head &&
-        (await this.refExists(git, packBaselineRaw))
-          ? packBaselineRaw
-          : null;
-      const packRefs = [
+      // Prefer the host-supplied upstream HEAD, but only when it is actually usable as a
+      // negative pack ref: it must exist in this repo's object store (otherwise pack-objects
+      // aborts with "fatal: bad object") and differ from HEAD (a `^HEAD` term excludes HEAD
+      // itself, yielding an empty pack that omits the very commit we ship). When the provided
+      // head is missing OR unusable — not just null — derive the branch's upstream tracking
+      // commit from git directly. Without any baseline, pack-objects has no negative ref and
+      // packs the ENTIRE repo, blowing past the 30MB artifact limit. A correct full pack is
+      // safer than a tiny broken one, so when nothing resolves we fall back to null.
+      const providedBaseline = localGitState?.upstreamHead ?? null;
+      const providedUsable =
+        !!providedBaseline &&
+        providedBaseline !== checkpoint.head &&
+        (await this.refExists(git, providedBaseline));
+      const packBaseline = providedUsable
+        ? providedBaseline
+        : await this.resolveUpstreamBaseline(
+            git,
+            checkpoint.branch,
+            checkpoint.head,
+          );
+      const packPositives = [
         checkpoint.head,
         reconciledIndex.indexTree,
         checkpoint.worktreeTree,
-        packBaseline ? `^${packBaseline}` : null,
       ].filter((ref): ref is string => !!ref);
       const headRef = checkpoint.head
         ? `${HANDOFF_HEAD_REF_PREFIX}${checkpoint.checkpointId}`
@@ -147,10 +154,25 @@ export class GitHandoffTracker {
       const packPrefix = path.join(tempDir, checkpoint.checkpointId);
 
       const [headPack, indexFile, tracking] = await Promise.all([
-        this.captureObjectPack(packPrefix, packRefs),
+        this.captureObjectPack(packPrefix, packPositives, packBaseline),
         this.statFileArtifact(reconciledIndex.indexFilePath),
         getTrackingMetadata(git, checkpoint.branch),
       ]);
+
+      // Diagnostic: pin why a handoff sometimes ships an oversized pack (>30MB → 400 locally,
+      // 413 at the cloud gateway edge). The pack size is the fastest disambiguator: a large
+      // packBytes with a null packBaseline means no `^baseline` was excluded and the whole
+      // repo shipped; a resolved baseline should yield a small differential pack. Routed
+      // through the injected logger so it surfaces wherever the host forwards logs.
+      this.logger?.info("handoff pack baseline", {
+        providedUpstreamHead: providedBaseline,
+        providedUsable,
+        packBaseline,
+        head: checkpoint.head,
+        branch: checkpoint.branch,
+        packBytes: headPack?.rawBytes ?? 0,
+        indexBytes: indexFile.rawBytes,
+      });
 
       return {
         checkpoint: {
@@ -317,16 +339,84 @@ export class GitHandoffTracker {
 
   private async captureObjectPack(
     packPrefix: string,
-    refs: string[],
+    positives: string[],
+    baseline: string | null,
   ): Promise<GitHandoffArtifactFile> {
-    const hash = await this.runGitWithInput(
-      ["pack-objects", packPrefix, "--revs"],
-      `${refs.join("\n")}\n`,
-    );
+    let hash: string;
+    if (baseline) {
+      // In a `blob:none` partial clone, `git pack-objects --revs ^baseline` fails to keep the
+      // pack differential: the working tree materializes large blobs locally (they get
+      // re-hashed into `worktreeTree`), but the identical upstream copies were never fetched
+      // (promisor-absent), so the negative `^baseline` walk cannot mark them uninteresting and
+      // packs them anyway — easily blowing the 30MB artifact cap. Tree objects are always
+      // present in a blobless clone (only blobs are filtered), so enumerate the object SHAs the
+      // baseline already contains and subtract them from the pack's object list explicitly. The
+      // receiver reconstructs those objects from its own baseline (the existing "receiver has
+      // the baseline" contract). In a full clone this subtraction is a no-op, because
+      // `rev-list --not <baseline>` already excluded them — so behavior there is unchanged.
+      const baselineObjects = await this.listBaselineObjectShas(baseline);
+      const revList = await this.runGitWithInput(
+        ["rev-list", "--objects", ...positives, "--not", baseline],
+        "",
+      );
+      const packObjects: string[] = [];
+      for (const line of revList.split("\n")) {
+        if (!line) continue;
+        // `rev-list --objects` emits "<sha>" or "<sha> <path>".
+        const spaceIndex = line.indexOf(" ");
+        const sha = spaceIndex === -1 ? line : line.slice(0, spaceIndex);
+        if (!sha || baselineObjects.has(sha)) continue;
+        packObjects.push(sha);
+      }
+      this.logger?.info("handoff pack object exclusion", {
+        baseline,
+        baselineObjectCount: baselineObjects.size,
+        packObjectCount: packObjects.length,
+      });
+      // `git pack-objects <prefix>` (without --revs) reads explicit object names from stdin by
+      // default and packs exactly those — no traversal — producing the same
+      // `<prefix>-<hash>.pack` output as the --revs path.
+      hash = await this.runGitWithInput(
+        ["pack-objects", packPrefix],
+        `${packObjects.join("\n")}\n`,
+      );
+    } else {
+      // No baseline resolved: fall back to a self-contained full pack via the revision walk.
+      hash = await this.runGitWithInput(
+        ["pack-objects", packPrefix, "--revs"],
+        `${positives.join("\n")}\n`,
+      );
+    }
     const packPath = `${packPrefix}-${hash.trim()}.pack`;
     const rawBytes = await this.getFileSize(packPath);
     await rm(`${packPath}.idx`, { force: true }).catch(() => {});
     return { path: packPath, rawBytes };
+  }
+
+  /**
+   * The set of object SHAs (blobs + sub-trees) reachable from `baseline`'s tree. Uses
+   * `ls-tree -r -t`, which reads tree objects only — these are present even in a `blob:none`
+   * partial clone where the blobs themselves are promisor-absent. Callers subtract this set
+   * from a pack's object list so blobs the receiver can reconstruct from its own baseline are
+   * never shipped.
+   */
+  private async listBaselineObjectShas(baseline: string): Promise<Set<string>> {
+    const shas = new Set<string>();
+    const stdout = await this.runGitWithInput(
+      ["ls-tree", "-r", "-t", baseline],
+      "",
+    ).catch(() => "");
+    for (const line of stdout.split("\n")) {
+      if (!line) continue;
+      const tabIndex = line.indexOf("\t");
+      const meta = tabIndex < 0 ? line : line.slice(0, tabIndex);
+      const parts = meta.split(/\s+/);
+      // "<mode> <type> <sha>\t<path>"
+      if (parts.length >= 3 && parts[2]) {
+        shas.add(parts[2]);
+      }
+    }
+    return shas;
   }
 
   private async reconcileHandoffIndex(
@@ -502,9 +592,13 @@ export class GitHandoffTracker {
     // But fetch the CHECKPOINT's branch ref, because the baseline lives on the sender's
     // branch (e.g. a feature branch), not necessarily the receiver's current branch (which
     // may be main).  The same GitHub origin hosts both branches.
-    const preferredTracking = this.getPreferredTracking(localGitState, checkpoint);
+    const preferredTracking = this.getPreferredTracking(
+      localGitState,
+      checkpoint,
+    );
     const upstreamRemote = preferredTracking.upstreamRemote;
-    const upstreamMergeRef = checkpoint.upstreamMergeRef ?? preferredTracking.upstreamMergeRef;
+    const upstreamMergeRef =
+      checkpoint.upstreamMergeRef ?? preferredTracking.upstreamMergeRef;
     if (!upstreamRemote || !upstreamMergeRef) {
       this.logger?.warn(
         "Handoff baseline: no remote/ref to fetch baseline from; differential pack may fail to apply",
@@ -531,7 +625,8 @@ export class GitHandoffTracker {
     let isShallow = false;
     try {
       isShallow =
-        (await git.raw(["rev-parse", "--is-shallow-repository"])).trim() === "true";
+        (await git.raw(["rev-parse", "--is-shallow-repository"])).trim() ===
+        "true";
     } catch {
       // Older git without --is-shallow-repository — treat as non-shallow.
     }
@@ -594,15 +689,21 @@ export class GitHandoffTracker {
           );
         }
       }
-    } else if (!isShallow && baseline && !(await this.refExists(git, baseline))) {
+    } else if (
+      !isShallow &&
+      baseline &&
+      !(await this.refExists(git, baseline))
+    ) {
       // Non-shallow receiver, differential pack, baseline not yet present locally.
       // Fetch to pull in the baseline objects before unpacking.
-      await git.raw(["fetch", upstreamRemote, upstreamMergeRef]).catch((err) => {
-        this.logger?.error(
-          "Handoff baseline fetch failed; unpack/read-tree may fail with missing-object errors",
-          { err: String(err), remote: upstreamRemote, ref: upstreamMergeRef },
-        );
-      });
+      await git
+        .raw(["fetch", upstreamRemote, upstreamMergeRef])
+        .catch((err) => {
+          this.logger?.error(
+            "Handoff baseline fetch failed; unpack/read-tree may fail with missing-object errors",
+            { err: String(err), remote: upstreamRemote, ref: upstreamMergeRef },
+          );
+        });
     }
   }
 
@@ -742,6 +843,7 @@ export class GitHandoffTracker {
   private async resolveUpstreamBaseline(
     git: GitClient,
     branch?: string | null,
+    head?: string | null,
   ): Promise<string | null> {
     const candidates = [
       branch ? `${branch}@{upstream}` : null,
@@ -750,8 +852,13 @@ export class GitHandoffTracker {
     ].filter((ref): ref is string => !!ref);
     for (const ref of candidates) {
       try {
-        const sha = (await git.revparse(["--verify", `${ref}^{commit}`])).trim();
-        if (sha) {
+        const sha = (
+          await git.revparse(["--verify", `${ref}^{commit}`])
+        ).trim();
+        // Skip a candidate identical to HEAD: `^HEAD` excludes HEAD itself and yields an
+        // empty pack that omits the commit we're shipping. Returning a resolved SHA that
+        // is verified-present and != head keeps the result directly usable by the caller.
+        if (sha && sha !== head) {
           return sha;
         }
       } catch {
@@ -819,17 +926,29 @@ export class GitHandoffTracker {
     // can't fall back to local history — fails with
     // "fatal: failed to unpack tree object <worktreeTree>". Including them here
     // mirrors captureForHandoff()'s ref list and keeps the pack self-sufficient.
-    const safeBaseline =
-      baseline && (await this.refExists(git, baseline)) ? baseline : null;
-    const packRefs = [
+    // Prefer the caller-supplied baseline, but only when usable (present in this repo and
+    // != head); otherwise derive the branch's upstream tracking commit from git directly so
+    // the pack stays differential instead of shipping the whole repo. Mirrors
+    // captureForHandoff().
+    const providedUsable =
+      !!baseline &&
+      baseline !== meta.head &&
+      (await this.refExists(git, baseline));
+    const safeBaseline = providedUsable
+      ? baseline
+      : await this.resolveUpstreamBaseline(git, meta.branch, meta.head);
+    const packPositives = [
       checkpointRef,
       meta.head,
       meta.worktreeTree,
       meta.indexTree,
-      safeBaseline ? `^${safeBaseline}` : null,
     ].filter((r): r is string => !!r);
 
-    const artifact = await this.captureObjectPack(packPrefix, packRefs);
+    const artifact = await this.captureObjectPack(
+      packPrefix,
+      packPositives,
+      safeBaseline,
+    );
 
     return {
       artifact,
