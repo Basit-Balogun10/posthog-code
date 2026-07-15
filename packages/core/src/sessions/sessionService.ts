@@ -80,6 +80,7 @@ import {
 import { selectSessionsToEvict } from "./sessionEviction";
 import { createBaseSession } from "./sessionFactory";
 import { type ParsedSessionLogs, parseSessionLogContent } from "./sessionLogs";
+import { sessionStoreSetters } from "./sessionStore";
 
 const LOCAL_SESSION_RECONNECT_ATTEMPTS = 3;
 const LOCAL_SESSION_RECONNECT_BACKOFF = {
@@ -159,6 +160,7 @@ export interface SessionTrpc {
     unwatch: TrpcMutation;
     retry: TrpcMutation;
     sendCommand: TrpcMutation;
+    truncateLog: TrpcMutation;
     onUpdate: TrpcSubscription;
   };
   handoff: {
@@ -2102,6 +2104,41 @@ export class SessionService {
           });
       }
     }
+
+    // Cloud-origin restore: the sandbox broadcasts this once its own git
+    // revert + S3 log truncation finish (agent-server.ts handleRestoreCheckpoint),
+    // reusing the same channel as any other cloud session event rather than a
+    // bespoke reconnect call. There's no local git/agent to reconnect here —
+    // the sandbox tears down and rebuilds its own agent session in-process —
+    // so this only needs to reconcile the live transcript and surface a
+    // partial-truncation warning, mirroring the local restore path's toast.
+    if (
+      "method" in msg &&
+      "params" in msg &&
+      isNotification(msg.method, POSTHOG_NOTIFICATIONS.RESTORE_COMPLETE)
+    ) {
+      const params = msg.params as {
+        checkpointId?: string;
+        truncationFailed?: boolean;
+      };
+      if (params?.checkpointId) {
+        const trimmed = sessionStoreSetters.truncateEventsToCheckpoint(
+          session.taskId,
+          params.checkpointId,
+        );
+        this.d.log.info("Cloud checkpoint restore complete", {
+          taskRunId,
+          checkpointId: params.checkpointId,
+          trimmed,
+          truncationFailed: params.truncationFailed,
+        });
+        if (params.truncationFailed) {
+          this.d.toast.info(
+            "Checkpoint restored, but trimming the agent's history failed — it may still remember messages after this point.",
+          );
+        }
+      }
+    }
   }
 
   private drainQueuedMessages(
@@ -3549,14 +3586,84 @@ export class SessionService {
    */
   async restoreCheckpoint(input: {
     checkpointId: string;
-    repoPath: string;
+    // A cloud-only session can legitimately have no local repoPath at all —
+    // only the local path below requires one.
+    repoPath: string | undefined;
     taskRunId?: string;
   }): Promise<{
     restoredSessionId?: string;
     truncationFailed: boolean;
     adapter?: "claude" | "codex";
   }> {
-    return this.d.trpc.checkpoint.restore.mutate(input);
+    const session = input.taskRunId
+      ? this.d.store.getSessions()[input.taskRunId]
+      : undefined;
+    if (session?.isCloud) {
+      return this.restoreCloudCheckpoint(session, input.checkpointId);
+    }
+    if (!input.repoPath) {
+      throw new Error("No local repository path for this session");
+    }
+    // Local path: workspace-server drives git/fs directly against repoPath.
+    return this.d.trpc.checkpoint.restore.mutate({
+      ...input,
+      repoPath: input.repoPath,
+    });
+  }
+
+  /**
+   * Restores a checkpoint for a session that's still running IN THE CLOUD (no local handoff
+   * first). Unlike the local path, this never needs `repoPath` — a cloud-only task can
+   * legitimately have no local repoPath at all (see task-detail/taskInput.ts).
+   *
+   * Server-side restore (option B): the restore is DONE by truncating the durable S3 run log at
+   * the checkpoint — bounding the agent's memory immediately — rather than proxying a
+   * `restore_checkpoint` command to the sandbox. The sandbox is torn down between turns, so that
+   * command 400s ("No active sandbox"); and the git working tree lives inside a Modal resume
+   * snapshot Django can't touch. Instead the git tree is reconciled to the truncated log's tail
+   * checkpoint on the NEXT sandbox resume (agent-server `reconcileResumeGitCheckpoint`). We then
+   * synthesize the RESTORE_COMPLETE the sandbox would have broadcast so the live transcript trims
+   * exactly as the sandbox-driven path did (handleSessionEvent → truncateEventsToCheckpoint).
+   */
+  private async restoreCloudCheckpoint(
+    session: AgentSession,
+    checkpointId: string,
+  ): Promise<{
+    restoredSessionId?: string;
+    truncationFailed: boolean;
+    adapter?: "claude" | "codex";
+  }> {
+    const auth = await this.getCloudCommandAuth();
+    if (!auth) {
+      throw new Error("No cloud auth credentials available");
+    }
+    const result = await this.d.trpc.cloudTask.truncateLog.mutate({
+      taskId: session.taskId,
+      runId: session.taskRunId,
+      apiHost: auth.apiHost,
+      teamId: auth.teamId,
+      checkpointId,
+    });
+    // A failed truncate means the agent's memory was NOT bounded — treat as a hard restore
+    // failure rather than a silent partial (there's no independent git revert to have succeeded
+    // here, unlike the sandbox-driven path).
+    if (!result.success) {
+      throw new Error(result.error ?? "Cloud checkpoint restore failed");
+    }
+
+    // With no live sandbox to broadcast it, synthesize the completion notification so the live
+    // transcript trims to the checkpoint reactively, identical to the sandbox path.
+    this.enqueueSessionEvent(session.taskRunId, {
+      type: "acp_message",
+      ts: Date.now(),
+      message: {
+        jsonrpc: "2.0",
+        method: POSTHOG_NOTIFICATIONS.RESTORE_COMPLETE,
+        params: { checkpointId, truncationFailed: false },
+      },
+    });
+
+    return { truncationFailed: false };
   }
 
   async restoreCheckpointReconnect(

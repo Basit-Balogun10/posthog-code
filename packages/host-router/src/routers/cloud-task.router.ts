@@ -6,6 +6,8 @@ import {
   retryInput,
   sendCommandInput,
   sendCommandOutput,
+  truncateLogInput,
+  truncateLogOutput,
   unwatchInput,
   watchInput,
 } from "@posthog/core/cloud-task/schemas";
@@ -41,6 +43,15 @@ export const cloudTaskRouter = router({
       ctx.container
         .get<CloudTaskService>(CLOUD_TASK_SERVICE)
         .sendCommand(input),
+    ),
+
+  truncateLog: publicProcedure
+    .input(truncateLogInput)
+    .output(truncateLogOutput)
+    .mutation(({ ctx, input }) =>
+      ctx.container
+        .get<CloudTaskService>(CLOUD_TASK_SERVICE)
+        .truncateLog(input),
     ),
 
   onUpdate: publicProcedure

@@ -20,6 +20,8 @@ import {
   type SendCommandInput,
   type SendCommandOutput,
   type TaskRunStatus,
+  type TruncateLogInput,
+  type TruncateLogOutput,
   type WatchInput,
 } from "./schemas";
 import { type SseEvent, SseEventParser } from "./sse-parser";
@@ -514,6 +516,70 @@ export class CloudTaskService extends TypedEventEmitter<CloudTaskEvents> {
       this.log.error("Cloud task command error", {
         taskId: input.taskId,
         method: input.method,
+        error: errorMessage,
+      });
+      return { success: false, error: errorMessage };
+    }
+  }
+
+  /**
+   * Truncate the durable S3 run log at a checkpoint — the memory half of server-side
+   * cloud-origin restore (option B). Unlike {@link sendCommand}, this never proxies to the
+   * sandbox, so it works while the task is cloud-resident with no live sandbox (which is the
+   * common case, since the sandbox is torn down between turns). The git tree is reconciled to
+   * the truncated log's tail on the next sandbox resume (agent-server).
+   */
+  async truncateLog(input: TruncateLogInput): Promise<TruncateLogOutput> {
+    const url = `${input.apiHost}/api/projects/${input.teamId}/tasks/${input.taskId}/runs/${input.runId}/truncate_log/`;
+    const body: { checkpoint_id: string; prompt_id?: number } = {
+      checkpoint_id: input.checkpointId,
+    };
+    if (typeof input.promptId === "number") {
+      body.prompt_id = input.promptId;
+    }
+
+    try {
+      const response = await this.auth.authenticatedFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        let errorMessage = `Truncate log failed with status ${response.status}`;
+        try {
+          const errorJson = JSON.parse(errorText);
+          if (errorJson.error?.message) {
+            errorMessage = errorJson.error.message;
+          } else if (typeof errorJson.error === "string") {
+            errorMessage = errorJson.error;
+          }
+        } catch {
+          if (errorText) errorMessage = errorText;
+        }
+        this.log.warn("Cloud task truncate_log failed", {
+          taskId: input.taskId,
+          runId: input.runId,
+          checkpointId: input.checkpointId,
+          status: response.status,
+          error: errorMessage,
+        });
+        return { success: false, error: errorMessage };
+      }
+
+      this.log.info("Cloud task log truncated", {
+        taskId: input.taskId,
+        runId: input.runId,
+        checkpointId: input.checkpointId,
+      });
+      return { success: true };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      this.log.error("Cloud task truncate_log error", {
+        taskId: input.taskId,
+        checkpointId: input.checkpointId,
         error: errorMessage,
       });
       return { success: false, error: errorMessage };

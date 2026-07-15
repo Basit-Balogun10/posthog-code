@@ -40,6 +40,7 @@ const mockTrpcLogs = vi.hoisted(() => ({
 
 const mockTrpcCloudTask = vi.hoisted(() => ({
   sendCommand: { mutate: vi.fn() },
+  truncateLog: { mutate: vi.fn().mockResolvedValue({ success: true }) },
   watch: { mutate: vi.fn().mockResolvedValue(undefined) },
   retry: { mutate: vi.fn().mockResolvedValue(undefined) },
   unwatch: { mutate: vi.fn().mockResolvedValue(undefined) },

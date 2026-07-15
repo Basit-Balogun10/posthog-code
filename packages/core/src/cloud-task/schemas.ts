@@ -64,6 +64,7 @@ export const sendCommandInput = z.object({
     "close",
     "permission_response",
     "set_config_option",
+    "restore_checkpoint",
   ]),
   params: z.record(z.string(), z.unknown()).optional(),
 });
@@ -77,3 +78,25 @@ export const sendCommandOutput = z.object({
 });
 
 export type SendCommandOutput = z.infer<typeof sendCommandOutput>;
+
+// Server-side cloud-origin restore (option B): truncate the durable S3 run log at a checkpoint
+// with no live sandbox, bounding the agent's memory. The git tree follows on the next sandbox
+// resume (agent-server reconcileResumeGitCheckpoint). Backend endpoint:
+// POST /api/projects/{teamId}/tasks/{taskId}/runs/{runId}/truncate_log/
+export const truncateLogInput = z.object({
+  taskId: z.string(),
+  runId: z.string(),
+  apiHost: z.string(),
+  teamId: z.number(),
+  checkpointId: z.string(),
+  promptId: z.number().optional(),
+});
+
+export type TruncateLogInput = z.infer<typeof truncateLogInput>;
+
+export const truncateLogOutput = z.object({
+  success: z.boolean(),
+  error: z.string().optional(),
+});
+
+export type TruncateLogOutput = z.infer<typeof truncateLogOutput>;

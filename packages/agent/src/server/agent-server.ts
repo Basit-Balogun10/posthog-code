@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  cp,
+  mkdir,
+  readFile,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import type {
@@ -14,8 +22,14 @@ import {
   PROTOCOL_VERSION,
 } from "@agentclientprotocol/sdk";
 import { type ServerType, serve } from "@hono/node-server";
+import { createGitClient } from "@posthog/git/client";
 import { execGh } from "@posthog/git/gh";
 import { getCurrentBranch } from "@posthog/git/queries";
+import {
+  deleteCheckpoint,
+  RevertCheckpointSaga,
+  reconcileWorktreeToCheckpoint,
+} from "@posthog/git/sagas/checkpoint";
 import { unzipSync } from "fflate";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -39,6 +53,7 @@ import {
   SIGNED_MERGE_QUALIFIED_TOOL_NAME,
   SIGNED_REWRITE_QUALIFIED_TOOL_NAME,
 } from "../adapters/signed-commit-shared";
+import { truncateRunLogToCheckpoint } from "../checkpoint-restore-truncation";
 import type { PermissionMode } from "../execution-mode";
 import { DEFAULT_CODEX_MODEL, fetchGatewayModels } from "../gateway-models";
 import { HandoffCheckpointTracker } from "../handoff-checkpoint";
@@ -986,6 +1001,13 @@ export class AgentServer {
         };
       }
 
+      case "posthog/restore_checkpoint":
+      case "restore_checkpoint": {
+        const checkpointId = params.checkpointId as string;
+        this.logger.debug("Restore checkpoint requested", { checkpointId });
+        return await this.handleRestoreCheckpoint(checkpointId);
+      }
+
       case POSTHOG_METHODS.REFRESH_SESSION:
       case "posthog/refresh_session":
       case "refresh_session": {
@@ -1683,8 +1705,12 @@ export class AgentServer {
       taskRun,
       "Resume continuation",
       async () => {
+        // A warm resume reuses the snapshot's filesystem, so it skips the full checkpoint
+        // re-apply — but must still reconcile the git tree to the log's tail so a server-side
+        // cloud-origin restore (which truncated only the durable log) takes effect here. The
+        // reconcile is a no-op unless the snapshot's tree is actually ahead of the log.
         const checkpointApplied = this.nativeResume?.warm
-          ? false
+          ? await this.reconcileResumeGitCheckpoint(payload)
           : await this.applyResumeGitCheckpoint(payload);
 
         const pendingUserPrompt = await this.getPendingUserPrompt(taskRun);
@@ -1755,6 +1781,61 @@ export class AgentServer {
         await this.session.logWriter.flushAll();
       }
       await this.handleTurnFailure(payload, "resume", error);
+    }
+  }
+
+  /**
+   * Warm-resume counterpart to {@link applyResumeGitCheckpoint}. A warm native resume reuses the
+   * Modal snapshot's filesystem, so it normally SKIPS re-applying the checkpoint (the tree is
+   * already correct). But a server-side cloud-origin restore (option B) truncates only the durable
+   * S3 log — the snapshot Django can't touch still holds the pre-restore tree. So on a warm resume
+   * we reconcile the git tree to the log's tail checkpoint: a no-op when they already match (the
+   * common case, so warm resumes stay cheap), or a revert when a restore truncated the log below
+   * the snapshot's tree. Returns true only when it actually reverted (so the resume prompt can tell
+   * the agent the workspace changed). Mirrors applyResumeGitCheckpoint's materialize-then-retry for
+   * a target ref captured in a prior sandbox stint.
+   */
+  private async reconcileResumeGitCheckpoint(
+    payload: JwtPayload,
+  ): Promise<boolean> {
+    const tail = this.resumeState?.latestGitCheckpoint;
+    const repositoryPath = this.config.repositoryPath;
+    if (!tail || !tail.worktreeTree || !repositoryPath) {
+      return false;
+    }
+    try {
+      let result = await reconcileWorktreeToCheckpoint({
+        baseDir: repositoryPath,
+        checkpointId: tail.checkpointId,
+        worktreeTree: tail.worktreeTree,
+      });
+      if (result.status === "checkpoint-missing" && this.posthogAPI) {
+        const tracker = new HandoffCheckpointTracker({
+          repositoryPath,
+          taskId: payload.task_id,
+          runId: payload.run_id,
+          apiClient: this.posthogAPI,
+          logger: this.logger.child("HandoffCheckpoint"),
+        });
+        await tracker.materializeCheckpointRef(tail);
+        result = await reconcileWorktreeToCheckpoint({
+          baseDir: repositoryPath,
+          checkpointId: tail.checkpointId,
+          worktreeTree: tail.worktreeTree,
+        });
+      }
+      this.logger.debug("Warm resume git reconcile", {
+        status: result.status,
+        checkpointId: tail.checkpointId,
+        branch: tail.branch,
+      });
+      return result.status === "reverted";
+    } catch (error) {
+      this.logger.warn("Warm resume git reconcile failed", {
+        error: error instanceof Error ? error.message : String(error),
+        checkpointId: tail.checkpointId,
+      });
+      return false;
     }
   }
 
@@ -3442,6 +3523,168 @@ ${signedCommitInstructions}
       this.session.payload.run_id,
       JSON.stringify(notification),
     );
+  }
+
+  /** Finds a GIT_CHECKPOINT notification's params in the run's S3 log by checkpointId. */
+  private async findCheckpointEventInRunLog(
+    taskId: string,
+    runId: string,
+    checkpointId: string,
+  ): Promise<GitCheckpointEvent | null> {
+    if (!this.posthogAPI) return null;
+    const taskRun = await this.posthogAPI.getTaskRun(taskId, runId);
+    const entries = await this.posthogAPI.fetchTaskRunLogs(taskRun);
+    for (const entry of entries) {
+      const notif = (
+        entry as {
+          notification?: { method?: string; params?: GitCheckpointEvent };
+        }
+      ).notification;
+      if (
+        notif?.method === POSTHOG_NOTIFICATIONS.GIT_CHECKPOINT &&
+        notif.params?.checkpointId === checkpointId
+      ) {
+        return notif.params;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Restores this cloud session to a prior git checkpoint without a local
+   * handoff: reverts the sandbox's working tree, truncates the S3 run log to
+   * the checkpoint boundary, and tears down the current agent session so the
+   * next reconnect rebuilds memory bounded to the restored turn.
+   *
+   * Mirrors `CheckpointService.runRestore` (workspace-server, desktop-only) —
+   * shares its truncation/survivor logic via `truncateRunLogToCheckpoint` —
+   * but runs entirely in-process inside the sandbox, since workspace-server has
+   * no presence here.
+   */
+  private async handleRestoreCheckpoint(checkpointId: string): Promise<{
+    restoredSessionId?: string;
+    truncationFailed: boolean;
+    adapter?: "claude" | "codex";
+  }> {
+    if (!this.session || !this.config.repositoryPath || !this.posthogAPI) {
+      throw new Error("No active session to restore");
+    }
+    const { task_id: taskId, run_id: runId } = this.session.payload;
+    const repositoryPath = this.config.repositoryPath;
+    const adapter = this.getRuntimeAdapter();
+    const sessionIdBeforeRestore = this.session.acpSessionId;
+
+    // 1. Revert the sandbox's working tree to the checkpoint. If the ref isn't
+    // present here (e.g. the checkpoint was captured locally before a
+    // local→cloud handoff into THIS sandbox, or a prior stint), materialize it
+    // non-destructively from its S3 pack artifact first, then retry — the same
+    // rebuild `HandoffHostService.syncCloudCheckpoints` performs on the desktop
+    // side for the opposite direction.
+    let result = await new RevertCheckpointSaga().run({
+      baseDir: repositoryPath,
+      checkpointId,
+    });
+    if (!result.success) {
+      const checkpointEvent = await this.findCheckpointEventInRunLog(
+        taskId,
+        runId,
+        checkpointId,
+      );
+      if (!checkpointEvent) {
+        throw new Error(result.error ?? `Checkpoint ${checkpointId} not found`);
+      }
+      const tracker = new HandoffCheckpointTracker({
+        repositoryPath,
+        taskId,
+        runId,
+        apiClient: this.posthogAPI,
+        logger: this.logger.child("HandoffCheckpoint"),
+      });
+      await tracker.materializeCheckpointRef(checkpointEvent);
+      result = await new RevertCheckpointSaga().run({
+        baseDir: repositoryPath,
+        checkpointId,
+      });
+      if (!result.success) {
+        throw new Error(
+          result.error ?? `Failed to revert to checkpoint ${checkpointId}`,
+        );
+      }
+    }
+
+    // 2. Truncate the S3 run log (re-appending any surviving checkpoint
+    // markers the backend's position-based truncate would otherwise drop, and
+    // computing which orphaned checkpoint refs are safe to delete) — the same
+    // shared logic the desktop's local restore path uses. Non-fatal: the git
+    // revert already succeeded.
+    let truncationFailed = false;
+    try {
+      const truncateResult = await truncateRunLogToCheckpoint({
+        apiClient: this.posthogAPI,
+        taskId,
+        runId,
+        checkpointId,
+        // No in-memory survivor map exists in the sandbox (unlike workspace-
+        // server's AgentService) — truncateRunLogToCheckpoint re-derives every
+        // surviving marker directly from the truncated log's own GIT_CHECKPOINT
+        // entries, so an empty seed here is sufficient.
+        survivorCheckpointIds: new Set(),
+        survivingEntries: [],
+      });
+      if (truncateResult.idsToDelete.length > 0) {
+        const git = createGitClient(repositoryPath);
+        await Promise.all(
+          truncateResult.idsToDelete.map((id) =>
+            deleteCheckpoint(git, id).catch(() => {}),
+          ),
+        );
+      }
+    } catch {
+      truncationFailed = true;
+    }
+
+    // 3. Broadcast completion BEFORE tearing the session down — broadcastEvent
+    // is a no-op once this.session is null.
+    this.broadcastEvent({
+      type: "notification",
+      timestamp: new Date().toISOString(),
+      notification: {
+        jsonrpc: "2.0",
+        method: POSTHOG_NOTIFICATIONS.RESTORE_COMPLETE,
+        params: { checkpointId, adapter, truncationFailed },
+      },
+    });
+
+    // 4. Bound the agent's memory to the restored turn. Claude keeps
+    // conversation state in-process (not just on disk), so deleting the JSONL
+    // alone can't un-remember turns from a still-open ACP connection — the
+    // session itself must be torn down and rebuilt. cleanupSession() closes the
+    // SSE stream; the desktop's EventSource reconnects to GET /events, which
+    // (finding this.session === null) reinitializes a fresh session via the
+    // SAME resumeFromLog()-based path every ordinary sandbox reconnect already
+    // uses — now reading the just-truncated log, so both Claude
+    // (JSONL-hydration) and Codex (fresh session + bounded summary) end up
+    // bounded to the checkpoint with no bespoke restart logic. Deleting the
+    // stale JSONL first keeps a lingering warm-resume path from re-hydrating
+    // full pre-restore history if reconnect races the truncation.
+    if (adapter === "claude") {
+      try {
+        await unlink(
+          getSessionJsonlPath(sessionIdBeforeRestore, repositoryPath),
+        );
+      } catch (err: unknown) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT") {
+          this.logger.warn(
+            "Failed to delete stale session JSONL before restore reconnect",
+            { error: err instanceof Error ? err.message : String(err) },
+          );
+        }
+      }
+    }
+    await this.cleanupSession();
+
+    return { truncationFailed, adapter };
   }
 
   private extractHandoffLocalGitState(
