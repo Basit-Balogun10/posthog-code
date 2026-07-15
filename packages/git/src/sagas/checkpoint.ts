@@ -301,6 +301,87 @@ export class RevertCheckpointSaga extends GitSaga<
   }
 }
 
+export type ReconcileWorktreeStatus =
+  | "in-sync"
+  | "reverted"
+  | "checkpoint-missing"
+  | "reconcile-failed";
+
+export interface ReconcileWorktreeResult {
+  status: ReconcileWorktreeStatus;
+  /** The worktree tree SHA the working directory currently hashes to, when computable. */
+  currentWorktreeTree: string | null;
+  error?: string;
+}
+
+/**
+ * Reconcile the working tree to a target checkpoint's worktree, WITHOUT mutating anything
+ * when they already match. This backs "server-side" cloud-origin restore (option B): a restore
+ * while the task is cloud-resident truncates only the durable S3 log (bounding agent memory)
+ * because the git working tree lives in a Modal resume snapshot that Django can't touch. On the
+ * next sandbox resume we make the git tree follow the truncated log by reconciling to the log's
+ * tail checkpoint here.
+ *
+ * The guard is stateless — it recomputes the current worktree tree the SAME way capture does and
+ * compares SHAs, so no divergence flag or run-state plumbing is needed:
+ * - normal resume: current tree already == the log-tail checkpoint's `worktreeTree` → no-op;
+ * - post-restore resume: the snapshot predates the truncation, so the current tree is AHEAD of
+ *   the (now shorter) log's tail → revert to it.
+ *
+ * The mismatch guard matters because {@link RevertCheckpointSaga} is destructive (`reset --hard`
+ * + `clean -fd`); we must never run it on an ordinary in-sync resume. When the target ref is not
+ * present locally (e.g. the checkpoint was captured in a prior sandbox stint), returns
+ * `checkpoint-missing` so the caller can materialize it from its S3 pack and retry.
+ */
+export async function reconcileWorktreeToCheckpoint(input: {
+  baseDir: string;
+  checkpointId: string;
+  /** The target checkpoint's recorded worktree tree SHA (from its GIT_CHECKPOINT log event). */
+  worktreeTree: string;
+}): Promise<ReconcileWorktreeResult> {
+  const { baseDir, checkpointId, worktreeTree } = input;
+  const git = createGitClient(baseDir);
+
+  let currentWorktreeTree: string;
+  try {
+    const head = await getHeadShaOrNull(git);
+    currentWorktreeTree = (await createWorktreeTree(git, baseDir, head)).trim();
+  } catch (error) {
+    return {
+      status: "reconcile-failed",
+      currentWorktreeTree: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  if (currentWorktreeTree === worktreeTree) {
+    return { status: "in-sync", currentWorktreeTree };
+  }
+
+  // Diverged: the durable log was truncated below the snapshot's tree (a restore ran while no
+  // sandbox was live). Revert to the target — but only if its ref is actually present here.
+  const hasRef = await refExists(
+    git,
+    `${CHECKPOINT_REF_PREFIX}${checkpointId}`,
+  );
+  if (!hasRef) {
+    return { status: "checkpoint-missing", currentWorktreeTree };
+  }
+
+  const result = await new RevertCheckpointSaga().run({
+    baseDir,
+    checkpointId,
+  });
+  if (!result.success) {
+    return {
+      status: "reconcile-failed",
+      currentWorktreeTree,
+      error: result.error,
+    };
+  }
+  return { status: "reverted", currentWorktreeTree };
+}
+
 export interface DiffCheckpointInput extends GitSagaInput {
   from: string;
   to: string | "current";

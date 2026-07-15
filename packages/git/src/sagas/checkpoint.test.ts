@@ -10,6 +10,7 @@ import {
   getGitBusyState,
   listCheckpoints,
   RevertCheckpointSaga,
+  reconcileWorktreeToCheckpoint,
 } from "./checkpoint";
 
 async function setupRepo(): Promise<string> {
@@ -649,4 +650,85 @@ describe("checkpoint sagas", () => {
       );
     });
   });
+});
+
+describe("reconcileWorktreeToCheckpoint", () => {
+  // A checkout on Windows can re-apply CRLF (autocrlf), so compare content by line.
+  async function readNormalized(filePath: string): Promise<string> {
+    return (await readFile(filePath, "utf-8")).replace(/\r\n/g, "\n");
+  }
+
+  async function captureAndGetTree(
+    repoPath: string,
+    checkpointId: string,
+  ): Promise<string> {
+    const result = await new CaptureCheckpointSaga().run({
+      baseDir: repoPath,
+      checkpointId,
+    });
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("capture failed");
+    return result.data.worktreeTree;
+  }
+
+  it("is a no-op when the working tree already matches the target checkpoint", async () => {
+    await withRepo(async (repoPath) => {
+      const tree = await captureAndGetTree(repoPath, "cp1");
+
+      const result = await reconcileWorktreeToCheckpoint({
+        baseDir: repoPath,
+        checkpointId: "cp1",
+        worktreeTree: tree,
+      });
+
+      expect(result.status).toBe("in-sync");
+      // Working tree untouched.
+      expect(await readNormalized(path.join(repoPath, "a.txt"))).toBe("one\n");
+    });
+  }, 30000);
+
+  it("reverts the working tree when it has diverged ahead of the target (post-restore resume)", async () => {
+    await withRepo(async (repoPath) => {
+      // cp1 = the restore target (a.txt="one"). Then the session moved on: a later
+      // turn changed the file and captured cp2 — this is the Modal snapshot's state.
+      const targetTree = await captureAndGetTree(repoPath, "cp1");
+      await writeFile(path.join(repoPath, "a.txt"), "two\n");
+      await captureAndGetTree(repoPath, "cp2");
+      await writeFile(path.join(repoPath, "untracked.txt"), "scratch\n");
+      expect(await readNormalized(path.join(repoPath, "a.txt"))).toBe("two\n");
+
+      // A server-side restore truncated the log back to cp1; on resume we reconcile
+      // the snapshot's (ahead) tree down to cp1.
+      const result = await reconcileWorktreeToCheckpoint({
+        baseDir: repoPath,
+        checkpointId: "cp1",
+        worktreeTree: targetTree,
+      });
+
+      expect(result.status).toBe("reverted");
+      expect(await readNormalized(path.join(repoPath, "a.txt"))).toBe("one\n");
+    });
+  }, 30000);
+
+  it("reports checkpoint-missing when the target ref is absent so the caller can materialize it", async () => {
+    await withRepo(async (repoPath) => {
+      const git = createGitClient(repoPath);
+      const targetTree = await captureAndGetTree(repoPath, "cp1");
+      await writeFile(path.join(repoPath, "a.txt"), "two\n");
+      await captureAndGetTree(repoPath, "cp2");
+      // The target checkpoint's ref isn't present locally (e.g. captured in a prior
+      // sandbox stint before a handoff into this one).
+      await deleteCheckpoint(git, "cp1");
+
+      const result = await reconcileWorktreeToCheckpoint({
+        baseDir: repoPath,
+        checkpointId: "cp1",
+        worktreeTree: targetTree,
+      });
+
+      expect(result.status).toBe("checkpoint-missing");
+      // Non-destructive: the diverged tree is left intact for the caller to retry.
+      expect(await readNormalized(path.join(repoPath, "a.txt"))).toBe("two\n");
+    });
+  }, 30000);
 });
