@@ -339,6 +339,11 @@ export class AgentServer {
   // often arrives while newSession() is still awaited (this.session is still null),
   // causing a second session to be created and duplicate Slack messages to be sent.
   private initializationPromise: Promise<void> | null = null;
+
+  // Guards RUN_STARTED so readiness is announced exactly once per (re)initialization,
+  // and only AFTER the resume git checkpoint is applied (see emitRunStartedOnce). Reset
+  // at the start of each init so warm reconnects re-announce the agent coming online.
+  private runStartedEmitted = false;
   private pendingEvents: Record<string, unknown>[] = [];
   private deliveredMessageIds = new Set<string>();
   private pendingPermissions = new Map<
@@ -1386,60 +1391,15 @@ export class AgentServer {
     await logAgentshRuntimeInfo(this.logger);
     this.logger.debug(`Initial permission mode: ${initialPermissionMode}`);
 
-    // Lifecycle handshake: clients gate "agent is ready to accept user
-    // messages" on this notification. Persisted to the session log so
-    // warm reconnects (sandbox restart with snapshot resume) replay it
-    // and see the agent come online again.
-    const runStartedNotification = {
-      jsonrpc: "2.0" as const,
-      method: POSTHOG_NOTIFICATIONS.RUN_STARTED,
-      params: {
-        sessionId: acpSessionId,
-        runId: payload.run_id,
-        taskId: payload.task_id,
-        agentVersion: this.config.version ?? packageJson.version,
-      },
-    };
-    this.broadcastEvent({
-      type: "notification",
-      timestamp: new Date().toISOString(),
-      notification: runStartedNotification,
-    });
-    this.session.logWriter.appendRawLine(
-      payload.run_id,
-      JSON.stringify(runStartedNotification),
-    );
-
-    // Mirror the "agent" setup step onto the ingest leg the client is reading;
-    // the orchestrator's completed progress only lands in Django.
-    const agentStartedProgress = {
-      jsonrpc: "2.0" as const,
-      method: POSTHOG_NOTIFICATIONS.PROGRESS,
-      params: {
-        group: `setup:${payload.run_id}`,
-        step: "agent",
-        status: "completed",
-        label: "Started agent",
-      },
-    };
-    this.broadcastEvent({
-      type: "notification",
-      timestamp: new Date().toISOString(),
-      notification: agentStartedProgress,
-    });
-    this.session.logWriter.appendRawLine(
-      payload.run_id,
-      JSON.stringify(agentStartedProgress),
-    );
-
-    // Signal in_progress so the UI can start polling for updates
-    this.posthogAPI
-      .updateTaskRun(payload.task_id, payload.run_id, {
-        status: "in_progress",
-      })
-      .catch((err) =>
-        this.logger.debug("Failed to set task run to in_progress", err),
-      );
+    // Announce readiness (RUN_STARTED + "Started agent" + in_progress) only AFTER the
+    // resume git checkpoint has been applied/reconciled to the working tree. It used to
+    // fire HERE, before sendInitialTaskMessage ran the apply — which let a client's queued
+    // user prompt (sendCloudPrompt gates its queue on RUN_STARTED → status "connected")
+    // drain and run against the un-applied fork clone: the "file missing after handoff,
+    // agent recreates it" race. sendInitialTaskMessage now calls emitRunStartedOnce right
+    // after the apply and before the first prompt. Reset the once-guard per init so warm
+    // reconnects re-announce readiness.
+    this.runStartedEmitted = false;
 
     await this.sendInitialTaskMessage(payload, preTaskRun);
   }
@@ -1523,6 +1483,72 @@ export class AgentServer {
     );
   }
 
+  /**
+   * Emit the RUN_STARTED lifecycle handshake — the signal desktop/backend clients gate
+   * "agent is ready to accept user messages" on (sendCloudPrompt queues prompts until
+   * session.status flips to "connected" off this). MUST fire only AFTER the resume git
+   * checkpoint has been applied/reconciled to the working tree: emitting it before the apply
+   * (its former inline spot in _doInitializeSession) let a queued user prompt drain and run
+   * against the un-applied fork clone — the file-missing / recreate race on the first cloud
+   * turn after a handoff. Idempotent per init (runStartedEmitted, reset in
+   * _doInitializeSession); persisted to the log so warm reconnects replay it.
+   */
+  private emitRunStartedOnce(payload: JwtPayload): void {
+    if (this.runStartedEmitted || !this.session) return;
+    this.runStartedEmitted = true;
+
+    const runStartedNotification = {
+      jsonrpc: "2.0" as const,
+      method: POSTHOG_NOTIFICATIONS.RUN_STARTED,
+      params: {
+        sessionId: this.session.acpSessionId,
+        runId: payload.run_id,
+        taskId: payload.task_id,
+        agentVersion: this.config.version ?? packageJson.version,
+      },
+    };
+    this.broadcastEvent({
+      type: "notification",
+      timestamp: new Date().toISOString(),
+      notification: runStartedNotification,
+    });
+    this.session.logWriter.appendRawLine(
+      payload.run_id,
+      JSON.stringify(runStartedNotification),
+    );
+
+    // Mirror the "agent" setup step onto the ingest leg the client is reading;
+    // the orchestrator's completed progress only lands in Django.
+    const agentStartedProgress = {
+      jsonrpc: "2.0" as const,
+      method: POSTHOG_NOTIFICATIONS.PROGRESS,
+      params: {
+        group: `setup:${payload.run_id}`,
+        step: "agent",
+        status: "completed",
+        label: "Started agent",
+      },
+    };
+    this.broadcastEvent({
+      type: "notification",
+      timestamp: new Date().toISOString(),
+      notification: agentStartedProgress,
+    });
+    this.session.logWriter.appendRawLine(
+      payload.run_id,
+      JSON.stringify(agentStartedProgress),
+    );
+
+    // Signal in_progress so the UI can start polling for updates
+    this.posthogAPI
+      .updateTaskRun(payload.task_id, payload.run_id, {
+        status: "in_progress",
+      })
+      .catch((err) =>
+        this.logger.debug("Failed to set task run to in_progress", err),
+      );
+  }
+
   private async sendInitialTaskMessage(
     payload: JwtPayload,
     prefetchedRun?: TaskRun | null,
@@ -1568,6 +1594,10 @@ export class AgentServer {
     }
 
     try {
+      // Fresh (non-resume) task: no checkpoint to apply, the clone IS the workspace, so
+      // readiness can be announced immediately (before the initial task prompt runs).
+      this.emitRunStartedOnce(payload);
+
       const task = await this.posthogAPI.getTask(payload.task_id);
 
       const initialPromptOverride = taskRun
@@ -1643,6 +1673,10 @@ export class AgentServer {
 
       const checkpointApplied = await this.applyResumeGitCheckpoint(payload);
 
+      // Checkpoint applied — announce readiness so a prompt queued on RUN_STARTED drains
+      // against the applied tree, not the fork clone.
+      this.emitRunStartedOnce(payload);
+
       const pendingUserPrompt = await this.getPendingUserPrompt(taskRun);
 
       const checkpointContext = checkpointApplied
@@ -1712,6 +1746,10 @@ export class AgentServer {
         const checkpointApplied = this.nativeResume?.warm
           ? await this.reconcileResumeGitCheckpoint(payload)
           : await this.applyResumeGitCheckpoint(payload);
+
+        // Tree is now reconciled — announce readiness so any prompt a client queued on
+        // RUN_STARTED drains against the correct tree, not the pre-apply snapshot.
+        this.emitRunStartedOnce(payload);
 
         const pendingUserPrompt = await this.getPendingUserPrompt(taskRun);
         const prompt: ContentBlock[] = pendingUserPrompt?.prompt.length
