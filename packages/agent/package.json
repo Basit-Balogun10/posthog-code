@@ -80,6 +80,10 @@
       "types": "./dist/handoff-checkpoint.d.ts",
       "import": "./dist/handoff-checkpoint.js"
     },
+    "./checkpoint-restore-truncation": {
+      "types": "./dist/checkpoint-restore-truncation.d.ts",
+      "import": "./dist/checkpoint-restore-truncation.js"
+    },
     "./server": {
       "types": "./dist/server/agent-server.d.ts",
       "import": "./dist/server/agent-server.js"

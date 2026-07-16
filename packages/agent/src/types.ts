@@ -145,6 +145,15 @@ export interface GitCheckpointEvent extends GitCheckpoint {
   turnCompletedAt?: string;
 }
 
+/** Params carried by the `_posthog/restore_complete` notification (see POSTHOG_NOTIFICATIONS.RESTORE_COMPLETE). */
+export interface RestoreCompleteEvent {
+  checkpointId: string;
+  restoredSessionId?: string;
+  adapter?: "claude" | "codex";
+  /** True when the git revert succeeded but a log/memory truncation step failed (partial restore). */
+  truncationFailed: boolean;
+}
+
 /**
  * Keeps the emitted `@posthog/agent/types` entrypoint as a runtime ESM module.
  *

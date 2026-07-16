@@ -195,6 +195,36 @@ describe("validateCommandParams", () => {
     expect(result.success).toBe(false);
   });
 
+  it("accepts valid restore_checkpoint", () => {
+    const result = validateCommandParams("restore_checkpoint", {
+      checkpointId: "abc123",
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts posthog/restore_checkpoint", () => {
+    const result = validateCommandParams("posthog/restore_checkpoint", {
+      checkpointId: "abc123",
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects restore_checkpoint without checkpointId", () => {
+    const result = validateCommandParams("restore_checkpoint", {});
+
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects restore_checkpoint with an empty checkpointId", () => {
+    const result = validateCommandParams("restore_checkpoint", {
+      checkpointId: "",
+    });
+
+    expect(result.success).toBe(false);
+  });
+
   it("accepts _posthog/refresh_session with mcpServers", () => {
     const result = validateCommandParams("_posthog/refresh_session", {
       mcpServers: [

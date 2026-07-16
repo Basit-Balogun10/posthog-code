@@ -1,7 +1,6 @@
-import { POSTHOG_NOTIFICATIONS } from "@posthog/agent";
 import { getSessionJsonlPath } from "@posthog/agent/adapters/claude/session/jsonl-hydration";
+import { truncateRunLogToCheckpoint } from "@posthog/agent/checkpoint-restore-truncation";
 import { PostHogAPIClient } from "@posthog/agent/posthog-api";
-import type { StoredEntry } from "@posthog/agent/types";
 import { createGitClient } from "@posthog/git/client";
 import { isLocked, waitForUnlock } from "@posthog/git/lock-detector";
 import {
@@ -31,116 +30,14 @@ interface CheckpointLocalLogs {
   writeLocalLogs(taskRunId: string, content: string): Promise<void>;
 }
 
-/** Serialize stored log entries back to newline-delimited JSON. */
-function entriesToNdjson(entries: StoredEntry[]): string {
-  if (entries.length === 0) return "";
-  return `${entries.map((e) => JSON.stringify(e)).join("\n")}\n`;
-}
-
 /**
- * Trim a re-seeded logs.ndjson cache to the restore target's turn, keyed off the
- * checkpoint marker's TIMESTAMP rather than its line position or promptId.
- *
- * Why timestamp: after a local→cloud→local round-trip the pre-handoff checkpoint
- * markers are re-appended to the END of the run log (handoff `uploadPriorLocal-
- * Checkpoints`), so a pre-handoff checkpoint's marker is no longer in chronological
- * line order — the backend's checkpoint-id truncation and a line-position trim both
- * no-op (observed: 119→119 lines). promptId is also unusable: it collides across
- * the two session numbering spaces (observed: two distinct checkpoints both pid=2).
- * The marker keeps its ORIGINAL timestamp through the re-append, and every log entry
- * carries an ISO-8601 `…Z` timestamp (lexicographically == chronologically sortable),
- * so the marker's timestamp is a stable, handoff-safe boundary.
- *
- * Keeps entries with `timestamp <= boundary` plus the target marker itself (its
- * re-appended copy may carry a fresh restore-time timestamp). Returns null when the
- * target marker can't be located (caller leaves the cache as-is).
+ * Re-exported for the existing test suite (trimReseededCacheToCheckpoint's own
+ * unit tests import it from here). The implementation now lives in
+ * `@posthog/agent/checkpoint-restore-truncation` so the cloud-origin restore
+ * path (running inside the sandbox, which cannot import workspace-server) can
+ * share it instead of duplicating the survivor-marker defensive logic.
  */
-export function trimReseededCacheToCheckpoint(
-  logText: string,
-  checkpointId: string,
-): string | null {
-  const lines = logText.split("\n").filter((l) => l.trim());
-  const isTargetMarker = (parsed: {
-    notification?: { method?: string; params?: { checkpointId?: string } };
-  }): boolean =>
-    parsed.notification?.method === POSTHOG_NOTIFICATIONS.GIT_CHECKPOINT &&
-    parsed.notification.params?.checkpointId === checkpointId;
-
-  // Boundary = the target checkpoint's TURN-completion time. Prefer the
-  // `turnCompletedAt` carried in the marker's params: it's the true turn boundary
-  // and is stable across the S3 round-trip and the restore-time re-append. Only
-  // when no target marker carries it (pre-fix or cloud-registered checkpoints) do
-  // we fall back to the earliest marker ENTRY timestamp — which is
-  // capture-completion time and therefore keeps later turns when the snapshot
-  // outlives the next prompt, but preserves prior behavior for older logs.
-  let turnBoundaryTs: string | null = null;
-  let markerTs: string | null = null;
-  for (const line of lines) {
-    try {
-      const parsed = JSON.parse(line) as {
-        timestamp?: string;
-        notification?: {
-          method?: string;
-          params?: { checkpointId?: string; turnCompletedAt?: string };
-        };
-      };
-      if (!isTargetMarker(parsed)) continue;
-      const tca = parsed.notification?.params?.turnCompletedAt;
-      if (tca && (turnBoundaryTs === null || tca < turnBoundaryTs)) {
-        turnBoundaryTs = tca;
-      }
-      // EARLIEST marker occurrence (the original, not a restore-time re-append
-      // which sorts later).
-      if (
-        parsed.timestamp &&
-        (markerTs === null || parsed.timestamp < markerTs)
-      ) {
-        markerTs = parsed.timestamp;
-      }
-    } catch {
-      // skip unparseable lines
-    }
-  }
-  const boundaryTs = turnBoundaryTs ?? markerTs;
-  if (boundaryTs === null) return null;
-
-  const kept: string[] = [];
-  for (const line of lines) {
-    try {
-      const parsed = JSON.parse(line) as {
-        timestamp?: string;
-        notification?: {
-          method?: string;
-          params?: { checkpointId?: string; turnCompletedAt?: string };
-        };
-      };
-      // For a GIT_CHECKPOINT marker, compare by its TURN boundary
-      // (params.turnCompletedAt), not its entry timestamp: captures are async and
-      // land late, so an EARLIER surviving turn's marker can have an entry
-      // timestamp past the boundary even though its turn completed before it.
-      // Comparing by the entry timestamp would drop that survivor's marker,
-      // leaving the (kept) turn with a "no checkpoint captured" icon. Non-marker
-      // entries compare by their own timestamp as before.
-      const isMarker =
-        parsed.notification?.method === POSTHOG_NOTIFICATIONS.GIT_CHECKPOINT;
-      const effectiveTs = isMarker
-        ? (parsed.notification?.params?.turnCompletedAt ?? parsed.timestamp)
-        : parsed.timestamp;
-      // Keep everything up to and including the boundary, plus the target marker
-      // itself regardless of its (possibly re-appended) timestamp.
-      if (
-        isTargetMarker(parsed) ||
-        (effectiveTs != null && effectiveTs <= boundaryTs)
-      ) {
-        kept.push(line);
-      }
-    } catch {
-      // Preserve unparseable lines conservatively (rare).
-      kept.push(line);
-    }
-  }
-  return `${kept.join("\n")}\n`;
-}
+export { trimReseededCacheToCheckpoint } from "@posthog/agent/checkpoint-restore-truncation";
 
 /**
  * Restores a session to a git checkpoint: reverts working-tree files, truncates
@@ -302,76 +199,38 @@ export class CheckpointService {
           restoredSessionId = info.sessionId;
           restoredAdapter = info.adapter;
           const apiClient = this.apiClientFor(info);
-          let orphanedCheckpointIds: string[] = [];
+
           // Checkpoints that must NOT have their git refs deleted: the restore
           // target is always a survivor; the rest are filled from the in-memory
           // map and the truncated log below. The backend's orphan list can wrongly
           // include survivors after a handoff (scrambled S3 log), and deleting a
           // survivor's ref makes that turn un-restorable ("Checkpoint not found").
-          const survivorCheckpointIds = new Set<string>([input.checkpointId]);
-          for (const id of this.agentService.getSurvivingCheckpointIds(
-            input.taskRunId,
-            input.checkpointId,
-          )) {
-            survivorCheckpointIds.add(id);
-          }
+          const survivorCheckpointIds = new Set<string>(
+            this.agentService.getSurvivingCheckpointIds(
+              input.taskRunId,
+              input.checkpointId,
+            ),
+          );
+          const survivingEntries =
+            this.agentService.getSurvivingCheckpointEntries(
+              input.taskRunId,
+              input.checkpointId,
+            );
 
           // Truncate S3 + local cache BEFORE cancelling the session.
           // cancelSession triggers reconnect; if reconnect reads local cache
           // before truncation, the stale full history would be loaded.
+          let idsToDelete: string[] = [];
           try {
-            // Truncate by checkpoint_id only — do NOT send prompt_id. After a handoff
-            // the per-taskRun checkpoint map mixes promptIds from two session numbering
-            // spaces, so a checkpoint's stored promptId can point at the wrong entry and
-            // keep restore-truncated turns. The backend locates the boundary by
-            // checkpoint_id position — the same handoff-safe boundary the renderer's
-            // truncateEventsToCheckpoint and the local-cache trim below use.
-            const s3Result = await apiClient.truncateTaskRunLog(
-              info.taskId,
-              input.taskRunId,
-              input.checkpointId,
-            );
-            if (s3Result.truncated) {
-              orphanedCheckpointIds = s3Result.orphaned_checkpoint_ids ?? [];
-            }
-
-            // Re-append surviving checkpoint markers that the truncate dropped.
-            // The restored turn's own marker always sits after its prompt response,
-            // so the position-based S3 truncate removes it. Worse: captures are async
-            // and can finish SEVERAL turns late (minutes on a large repo), so an
-            // EARLIER surviving turn's marker can physically land in the log AFTER the
-            // target's marker — and the position truncate then cuts that survivor too,
-            // leaving it with a disabled "no checkpoint captured" icon even though it
-            // survives the restore (and it stays broken across reload, since S3 + the
-            // cache no longer carry it). The in-memory map still has every survivor
-            // with its authoritative promptId + true turnCompletedAt, so reconstruct
-            // each survivor's marker and re-append the ones the truncate removed —
-            // keeping ALL surviving turns restorable in the live view and on reload.
-            const survivingEntries =
-              this.agentService.getSurvivingCheckpointEntries(
-                input.taskRunId,
-                input.checkpointId,
-              );
-            const buildMarkerEntry = (e: {
-              checkpointId: string;
-              promptId: number | undefined;
-              turnCompletedAt?: string;
-            }): StoredEntry => ({
-              type: "notification",
-              // Prefer the true turn-completion time so the marker sits on the
-              // correct boundary; only fall back to "now" (restore time) when the
-              // turn timestamp is unknown (pre-fix/cloud-registered checkpoints).
-              timestamp: e.turnCompletedAt ?? new Date().toISOString(),
-              notification: {
-                jsonrpc: "2.0",
-                method: POSTHOG_NOTIFICATIONS.GIT_CHECKPOINT,
-                params: {
-                  checkpointId: e.checkpointId,
-                  promptId: e.promptId,
-                  turnCompletedAt: e.turnCompletedAt,
-                },
-              },
+            const truncateResult = await truncateRunLogToCheckpoint({
+              apiClient,
+              taskId: info.taskId,
+              runId: input.taskRunId,
+              checkpointId: input.checkpointId,
+              survivorCheckpointIds,
+              survivingEntries,
             });
+            idsToDelete = truncateResult.idsToDelete;
 
             // Re-seed the local logs.ndjson cache from the (now truncated, with any
             // dropped survivor markers re-appended) S3 run log. The cache is a live
@@ -379,99 +238,14 @@ export class CheckpointService {
             // wholesale with the cloud log (handoff seedLocalLogs) and so lacks the
             // pre-handoff checkpoint marker — a marker-based local trim can't cut at
             // the restore point. Reload reads this cache first, so without re-seeding
-            // it the restore-truncated turns reappear on reload. We fetch the run log
-            // authoritatively (the renderer's session.logUrl is unreliable for
-            // handed-off tasks) and overwrite the cache before cancelSession triggers
-            // the reconnect. Non-fatal: git files are already reverted; a failure only
-            // means reload may show stale turns or a disabled survivor icon.
-            if (s3Result.truncated) {
-              try {
-                const taskRun = await apiClient.getTaskRun(
-                  info.taskId,
-                  input.taskRunId,
-                );
-                let truncatedEntries =
-                  await apiClient.fetchTaskRunLogs(taskRun);
-
-                // Which surviving markers did the position-based truncate drop?
-                // Re-append those (target included — it's always dropped) so every
-                // survivor's marker is durable in S3 and present in the cache below.
-                const presentCheckpointIds = new Set<string>();
-                for (const entry of truncatedEntries) {
-                  const notif = (
-                    entry as {
-                      notification?: {
-                        method?: string;
-                        params?: { checkpointId?: string };
-                      };
-                    }
-                  ).notification;
-                  if (
-                    notif?.method === POSTHOG_NOTIFICATIONS.GIT_CHECKPOINT &&
-                    notif.params?.checkpointId
-                  ) {
-                    presentCheckpointIds.add(notif.params.checkpointId);
-                  }
-                }
-                const missingMarkers = survivingEntries
-                  .filter(
-                    (e) =>
-                      e.promptId != null &&
-                      !presentCheckpointIds.has(e.checkpointId),
-                  )
-                  .map(buildMarkerEntry);
-                if (missingMarkers.length > 0) {
-                  await apiClient
-                    .appendTaskRunLog(
-                      info.taskId,
-                      input.taskRunId,
-                      missingMarkers,
-                    )
-                    .catch(() => {
-                      // Non-fatal: a survivor may show a disabled restore icon.
-                    });
-                  // Include locally without a second round-trip so the cache we
-                  // write below carries them even if the S3 append lagged.
-                  truncatedEntries = [...truncatedEntries, ...missingMarkers];
-                }
-
-                const truncatedLog = entriesToNdjson(truncatedEntries);
-                if (truncatedLog.trim()) {
-                  // The backend truncates by checkpoint-id position, which no-ops
-                  // when the restore target is a pre-handoff checkpoint (its marker
-                  // was re-appended to the log tail). Trim by the marker's timestamp
-                  // so reload doesn't resurrect post-restore turns. Falls back to the
-                  // backend log when the marker can't be located.
-                  const trimmedLog =
-                    trimReseededCacheToCheckpoint(
-                      truncatedLog,
-                      input.checkpointId,
-                    ) ?? truncatedLog;
-                  await this.logs.writeLocalLogs(input.taskRunId, trimmedLog);
-                  // Every GIT_CHECKPOINT marker still present in the truncated
-                  // log is a surviving checkpoint — protect its ref from the
-                  // orphan-cleanup below. This source survives an app restart
-                  // (unlike the in-memory map).
-                  for (const entry of truncatedEntries) {
-                    const notif = (
-                      entry as {
-                        notification?: {
-                          method?: string;
-                          params?: { checkpointId?: string };
-                        };
-                      }
-                    ).notification;
-                    if (
-                      notif?.method === POSTHOG_NOTIFICATIONS.GIT_CHECKPOINT &&
-                      notif.params?.checkpointId
-                    ) {
-                      survivorCheckpointIds.add(notif.params.checkpointId);
-                    }
-                  }
-                }
-              } catch {
-                // Non-fatal: reload may show stale turns.
-              }
+            // it the restore-truncated turns reappear on reload. Non-fatal: git files
+            // are already reverted; a failure only means reload may show stale turns
+            // or a disabled survivor icon.
+            if (truncateResult.truncatedLog) {
+              await this.logs.writeLocalLogs(
+                input.taskRunId,
+                truncateResult.truncatedLog,
+              );
             }
           } catch {
             truncationFailed = true;
@@ -484,9 +258,6 @@ export class CheckpointService {
           // Deleting a survivor's ref is what made earlier turns un-restorable
           // ("Checkpoint not found"). A leftover orphan ref is benign, so over-
           // deletion is the only harmful direction — when in doubt, keep.
-          const idsToDelete = orphanedCheckpointIds.filter(
-            (id) => !survivorCheckpointIds.has(id),
-          );
           if (idsToDelete.length > 0) {
             const git = createGitClient(input.repoPath);
             await Promise.all(

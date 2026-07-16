@@ -20,6 +20,7 @@ export const POSTHOG_NOTIFICATIONS = {
   PERMISSION_RESPONSE: "_posthog/permission_response",
   PERMISSION_REQUEST: "_posthog/permission_request",
   PERMISSION_RESOLVED: "_posthog/permission_resolved",
+  RESTORE_COMPLETE: "_posthog/restore_complete",
 } as const;
 
 type PosthogNotification =

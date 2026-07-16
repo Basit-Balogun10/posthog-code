@@ -78,6 +78,9 @@ export const POSTHOG_NOTIFICATIONS = {
 
   /** Permission request resolved, persisted so a reconnecting client can tell it is no longer pending */
   PERMISSION_RESOLVED: "_posthog/permission_resolved",
+
+  /** A cloud-side checkpoint restore finished (success or partial); tells connected clients to trim their live view */
+  RESTORE_COMPLETE: "_posthog/restore_complete",
 } as const;
 
 /**

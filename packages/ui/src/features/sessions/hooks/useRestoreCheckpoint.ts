@@ -43,23 +43,16 @@ export function useRestoreCheckpoint({
   );
 
   const confirmRestore = useCallback(async () => {
-    if (!pendingCheckpointId || !repoPath) return;
-
     const session = taskId
       ? sessionStoreSetters.getSessionByTaskId(taskId)
       : undefined;
 
-    // Checkpoint packs from cloud turns are only available in local git after
-    // the cloud→local handoff (syncCloudCheckpointsFromLog). If the task is
-    // still running in the cloud, guide the user to continue locally first.
-    if (session?.isCloud) {
-      toast.info(
-        "To restore a cloud checkpoint, continue the task locally first.",
-      );
-      setDialogOpen(false);
-      setPendingCheckpointId(null);
-      return;
-    }
+    // repoPath is only required for the local restore path — a cloud-only
+    // session can legitimately have no local repoPath at all (see
+    // packages/core/src/task-detail/taskInput.ts). The cloud command path
+    // (sessionService.restoreCheckpoint → restoreCloudCheckpoint) never
+    // touches it.
+    if (!pendingCheckpointId || (!repoPath && !session?.isCloud)) return;
 
     setIsRestoring(true);
     try {
@@ -97,15 +90,22 @@ export function useRestoreCheckpoint({
           );
         }
         // Reconnect the agent, resuming the same Codex/Claude session so the
-        // agent has memory only up to the restored checkpoint.
-        sessionService
-          .restoreCheckpointReconnect(
-            taskId,
-            repoPath,
-            restoreResult?.restoredSessionId,
-            restoreResult?.adapter,
-          )
-          .catch(() => {});
+        // agent has memory only up to the restored checkpoint. Cloud sessions
+        // skip this: the sandbox tears down and rebuilds its own agent session
+        // in-process (agent-server.ts handleRestoreCheckpoint), and the live
+        // view reconciles reactively off the RESTORE_COMPLETE notification
+        // (see sessionService.handleSessionEvent) instead of an explicit
+        // desktop-driven reconnect call.
+        if (!session?.isCloud && repoPath) {
+          sessionService
+            .restoreCheckpointReconnect(
+              taskId,
+              repoPath,
+              restoreResult?.restoredSessionId,
+              restoreResult?.adapter,
+            )
+            .catch(() => {});
+        }
       }
       if (restoreResult?.truncationFailed) {
         toast.warning(

@@ -2126,6 +2126,16 @@ export class SessionService {
           session.taskId,
           params.checkpointId,
         );
+        // The trim slices events down to the post-checkpoint turn boundary, which
+        // drops THIS completion marker — it was appended at the old tail (above),
+        // now past the cut. Re-append it so it survives at the new live tip. The
+        // sandbox-broadcast path leaves the marker observable there naturally; the
+        // synthesized cloud-origin path (restoreCloudCheckpoint) must reinstate it
+        // so the transcript's tip — and any listener watching for completion —
+        // still sees the signal, keeping the two paths behaviorally identical.
+        if (trimmed) {
+          this.d.store.appendEvents(taskRunId, [acpMsg]);
+        }
         this.d.log.info("Cloud checkpoint restore complete", {
           taskRunId,
           checkpointId: params.checkpointId,

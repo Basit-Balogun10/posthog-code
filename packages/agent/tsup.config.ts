@@ -109,6 +109,7 @@ export default defineConfig([
       "src/agent.ts",
       "src/gateway-models.ts",
       "src/handoff-checkpoint.ts",
+      "src/checkpoint-restore-truncation.ts",
       "src/posthog-api.ts",
       "src/posthog-products.ts",
       "src/pr-url-detector.ts",

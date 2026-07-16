@@ -102,6 +102,10 @@ export const closeParamsSchema = z
   })
   .optional();
 
+export const restoreCheckpointParamsSchema = z.object({
+  checkpointId: z.string().min(1, "checkpointId is required"),
+});
+
 export const commandParamsSchemas = {
   user_message: userMessageParamsSchema,
   "posthog/user_message": userMessageParamsSchema,
@@ -116,6 +120,8 @@ export const commandParamsSchemas = {
   refresh_session: refreshSessionParamsSchema,
   "posthog/refresh_session": refreshSessionParamsSchema,
   "_posthog/refresh_session": refreshSessionParamsSchema,
+  restore_checkpoint: restoreCheckpointParamsSchema,
+  "posthog/restore_checkpoint": restoreCheckpointParamsSchema,
 } as const;
 
 export type CommandMethod = keyof typeof commandParamsSchemas;
