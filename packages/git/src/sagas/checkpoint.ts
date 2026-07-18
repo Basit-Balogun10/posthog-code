@@ -816,6 +816,17 @@ async function refExists(git: GitClient, refName: string): Promise<boolean> {
   }
 }
 
+// Whether an object (by SHA or peeled ref like `<sha>^{tree}`) is physically
+// present in this repo's object DB. `cat-file -e` exits non-zero when absent.
+async function objectExists(git: GitClient, object: string): Promise<boolean> {
+  try {
+    await git.raw(["cat-file", "-e", object]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export interface CheckpointInfo {
   checkpointId: string;
   commit: string;
@@ -897,6 +908,21 @@ export async function materializeCheckpointRefFromMetadata(
     throw new Error(
       `Cannot materialize checkpoint ${meta.checkpointId}: missing tree data`,
     );
+  }
+
+  // git's write-tree/commit-tree happily build a ref that POINTS at tree SHAs
+  // whose objects are absent from this repo's object DB — the ref then looks
+  // valid but a subsequent revert can't populate the working tree, leaving it
+  // unchanged while still reporting success. This bites when a local-origin
+  // checkpoint is materialized in a cloud sandbox WITHOUT its head pack (the
+  // pack must have been downloaded+unpacked first). Fail loudly instead of
+  // silently producing a no-op restore.
+  for (const tree of [meta.indexTree, meta.worktreeTree]) {
+    if (!(await objectExists(git, `${tree}^{tree}`))) {
+      throw new Error(
+        `Cannot materialize checkpoint ${meta.checkpointId}: tree ${tree} is not present in the object DB (head pack missing or not unpacked)`,
+      );
+    }
   }
 
   const metaTree = (

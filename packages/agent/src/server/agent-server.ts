@@ -1009,8 +1009,22 @@ export class AgentServer {
       case "posthog/restore_checkpoint":
       case "restore_checkpoint": {
         const checkpointId = params.checkpointId as string;
-        this.logger.debug("Restore checkpoint requested", { checkpointId });
-        return await this.handleRestoreCheckpoint(checkpointId);
+        // keepSessionAlive: the desktop's cloud-origin restore (restore WHILE the
+        // sandbox is live) sets this so we revert git + truncate the log + trim the
+        // view but DON'T tear the ACP session down. Tearing it down ends the durable
+        // event stream (STREAM_END sentinel), which permanently stops the desktop's
+        // cloud watcher with no reconnect — so the next turn could never stream back.
+        // Keeping the session warm leaves the stream intact; the truncated durable
+        // log still bounds memory on any future resume/handoff.
+        const keepSessionAlive = params.keepSessionAlive === true;
+        this.logger.debug("Restore checkpoint requested", {
+          checkpointId,
+          keepSessionAlive,
+        });
+        return await this.handleRestoreCheckpoint(
+          checkpointId,
+          keepSessionAlive,
+        );
       }
 
       case POSTHOG_METHODS.REFRESH_SESSION:
@@ -3572,6 +3586,14 @@ ${signedCommitInstructions}
     if (!this.posthogAPI) return null;
     const taskRun = await this.posthogAPI.getTaskRun(taskId, runId);
     const entries = await this.posthogAPI.fetchTaskRunLogs(taskRun);
+    // A single checkpointId can appear MORE THAN ONCE in the run log. A
+    // local-origin checkpoint (e.g. cp_L1, captured before a local→cloud
+    // handoff) is first seeded from the local log WITHOUT an artifactPath, and
+    // then re-appended by uploadPriorLocalCheckpoints WITH its pack uploaded to
+    // storage (artifactPath populated). Materialize needs the pack, so we must
+    // prefer the enriched event — returning the first match would hand back the
+    // artifactPath-less one and silently produce a no-op revert (hasHeadPack:false).
+    let fallback: GitCheckpointEvent | null = null;
     for (const entry of entries) {
       const notif = (
         entry as {
@@ -3582,10 +3604,11 @@ ${signedCommitInstructions}
         notif?.method === POSTHOG_NOTIFICATIONS.GIT_CHECKPOINT &&
         notif.params?.checkpointId === checkpointId
       ) {
-        return notif.params;
+        if (notif.params.artifactPath) return notif.params;
+        fallback = notif.params;
       }
     }
-    return null;
+    return fallback;
   }
 
   /**
@@ -3599,7 +3622,10 @@ ${signedCommitInstructions}
    * but runs entirely in-process inside the sandbox, since workspace-server has
    * no presence here.
    */
-  private async handleRestoreCheckpoint(checkpointId: string): Promise<{
+  private async handleRestoreCheckpoint(
+    checkpointId: string,
+    keepSessionAlive = false,
+  ): Promise<{
     restoredSessionId?: string;
     truncationFailed: boolean;
     adapter?: "claude" | "codex";
@@ -3612,23 +3638,59 @@ ${signedCommitInstructions}
     const adapter = this.getRuntimeAdapter();
     const sessionIdBeforeRestore = this.session.acpSessionId;
 
+    // Timing instrumentation — these broadcast as _posthog/console to the desktop, so a run's
+    // console log shows exactly how long each phase takes (the restore is suspected slow under
+    // per-repo write-lock contention) and whether a local-origin target's materialize succeeds.
+    const restoreStartMs = Date.now();
+    const since = () => `${Date.now() - restoreStartMs}ms`;
+    this.logger.info("CloudRestore: begin", {
+      checkpointId,
+      keepSessionAlive,
+      adapter,
+    });
+
     // 1. Revert the sandbox's working tree to the checkpoint. If the ref isn't
     // present here (e.g. the checkpoint was captured locally before a
     // local→cloud handoff into THIS sandbox, or a prior stint), materialize it
     // non-destructively from its S3 pack artifact first, then retry — the same
     // rebuild `HandoffHostService.syncCloudCheckpoints` performs on the desktop
     // side for the opposite direction.
+    const revert1Start = Date.now();
+    this.logger.info("CloudRestore: revert (attempt 1) starting", {
+      checkpointId,
+    });
     let result = await new RevertCheckpointSaga().run({
       baseDir: repositoryPath,
       checkpointId,
     });
+    this.logger.info("CloudRestore: revert (attempt 1) done", {
+      checkpointId,
+      success: result.success,
+      error: result.success ? undefined : result.error,
+      revertMs: Date.now() - revert1Start,
+      totalMs: since(),
+    });
     if (!result.success) {
+      // Ref not present locally in the sandbox — needs S3 materialize first. This is the
+      // LOCAL-origin-target path (e.g. cp_L1 restored while cloud-resident) — the suspected
+      // failure. Log the materialize timing/outcome distinctly.
+      this.logger.info("CloudRestore: ref absent → materializing from S3", {
+        checkpointId,
+        totalMs: since(),
+      });
       const checkpointEvent = await this.findCheckpointEventInRunLog(
         taskId,
         runId,
         checkpointId,
       );
       if (!checkpointEvent) {
+        this.logger.warn(
+          "CloudRestore: checkpoint event NOT FOUND in run log",
+          {
+            checkpointId,
+            totalMs: since(),
+          },
+        );
         throw new Error(result.error ?? `Checkpoint ${checkpointId} not found`);
       }
       const tracker = new HandoffCheckpointTracker({
@@ -3638,11 +3700,28 @@ ${signedCommitInstructions}
         apiClient: this.posthogAPI,
         logger: this.logger.child("HandoffCheckpoint"),
       });
+      const materializeStart = Date.now();
       await tracker.materializeCheckpointRef(checkpointEvent);
+      this.logger.info("CloudRestore: materialize done", {
+        checkpointId,
+        materializeMs: Date.now() - materializeStart,
+        totalMs: since(),
+      });
+      const revert2Start = Date.now();
       result = await new RevertCheckpointSaga().run({
         baseDir: repositoryPath,
         checkpointId,
       });
+      this.logger.info(
+        "CloudRestore: revert (attempt 2, post-materialize) done",
+        {
+          checkpointId,
+          success: result.success,
+          error: result.success ? undefined : result.error,
+          revertMs: Date.now() - revert2Start,
+          totalMs: since(),
+        },
+      );
       if (!result.success) {
         throw new Error(
           result.error ?? `Failed to revert to checkpoint ${checkpointId}`,
@@ -3656,6 +3735,11 @@ ${signedCommitInstructions}
     // shared logic the desktop's local restore path uses. Non-fatal: the git
     // revert already succeeded.
     let truncationFailed = false;
+    const truncateStart = Date.now();
+    this.logger.info("CloudRestore: truncating run log", {
+      checkpointId,
+      totalMs: since(),
+    });
     try {
       const truncateResult = await truncateRunLogToCheckpoint({
         apiClient: this.posthogAPI,
@@ -3680,48 +3764,91 @@ ${signedCommitInstructions}
     } catch {
       truncationFailed = true;
     }
+    this.logger.info("CloudRestore: truncate done", {
+      checkpointId,
+      truncationFailed,
+      truncateMs: Date.now() - truncateStart,
+      totalMs: since(),
+    });
 
     // 3. Broadcast completion BEFORE tearing the session down — broadcastEvent
     // is a no-op once this.session is null.
+    this.logger.info("CloudRestore: broadcasting RESTORE_COMPLETE", {
+      checkpointId,
+      truncationFailed,
+      totalMs: since(),
+    });
+    const restoreCompleteNotification = {
+      jsonrpc: "2.0" as const,
+      method: POSTHOG_NOTIFICATIONS.RESTORE_COMPLETE,
+      params: { checkpointId, adapter, truncationFailed },
+    };
     this.broadcastEvent({
       type: "notification",
       timestamp: new Date().toISOString(),
-      notification: {
-        jsonrpc: "2.0",
-        method: POSTHOG_NOTIFICATIONS.RESTORE_COMPLETE,
-        params: { checkpointId, adapter, truncationFailed },
-      },
+      notification: restoreCompleteNotification,
     });
+    // ALSO persist the structured completion event to the durable run log. broadcastEvent
+    // only reaches the LIVE stream (eventStreamSender + SSE), whose delivery to the desktop
+    // can stall for minutes; the durable log is the reliable, promptly-written source the
+    // desktop polls as a fallback. We persist the STRUCTURED notification (not the human
+    // `CloudRestore:` console lines, which get stripped in pre-release log cleanup) so the
+    // fast-completion signal survives that cleanup. Mirrors emitConsoleLog's dual write.
+    if (this.session) {
+      this.session.logWriter.appendRawLine(
+        this.session.payload.run_id,
+        JSON.stringify(restoreCompleteNotification),
+      );
+    }
 
-    // 4. Bound the agent's memory to the restored turn. Claude keeps
-    // conversation state in-process (not just on disk), so deleting the JSONL
-    // alone can't un-remember turns from a still-open ACP connection — the
-    // session itself must be torn down and rebuilt. cleanupSession() closes the
-    // SSE stream; the desktop's EventSource reconnects to GET /events, which
-    // (finding this.session === null) reinitializes a fresh session via the
-    // SAME resumeFromLog()-based path every ordinary sandbox reconnect already
-    // uses — now reading the just-truncated log, so both Claude
-    // (JSONL-hydration) and Codex (fresh session + bounded summary) end up
-    // bounded to the checkpoint with no bespoke restart logic. Deleting the
-    // stale JSONL first keeps a lingering warm-resume path from re-hydrating
-    // full pre-restore history if reconnect races the truncation.
-    if (adapter === "claude") {
-      try {
-        await unlink(
-          getSessionJsonlPath(sessionIdBeforeRestore, repositoryPath),
-        );
-      } catch (err: unknown) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code !== "ENOENT") {
-          this.logger.warn(
-            "Failed to delete stale session JSONL before restore reconnect",
-            { error: err instanceof Error ? err.message : String(err) },
+    // 4. Bound the agent's memory to the restored turn.
+    //
+    // keepSessionAlive (cloud-origin restore, sandbox still LIVE): DON'T tear the
+    // session down. Tearing it down closes the SSE / ends the durable event stream,
+    // which permanently stops the desktop's cloud-task watcher (durable watches only
+    // stop on the STREAM_END sentinel and never reconnect) — so the next turn could
+    // never stream back and the whole task would wedge. The git tree is already
+    // reverted and the durable log already truncated, so memory is bounded on any
+    // future resume/handoff; the still-warm agent re-reads the (reverted) files on
+    // its next turn. We accept that the live in-process rollout may still reference
+    // the undone turns until that next fresh resume — a clean in-place ACP reset that
+    // preserves the stream is a possible follow-up if that ever matters in practice.
+    //
+    // Otherwise (the historical between-turns path): Claude keeps conversation state
+    // in-process (not just on disk), so deleting the JSONL alone can't un-remember
+    // turns from a still-open ACP connection — the session itself must be torn down
+    // and rebuilt. cleanupSession() closes the SSE stream; the desktop's EventSource
+    // reconnects to GET /events, which (finding this.session === null) reinitializes a
+    // fresh session via the SAME resumeFromLog()-based path every ordinary sandbox
+    // reconnect already uses — now reading the just-truncated log, so both Claude
+    // (JSONL-hydration) and Codex (fresh session + bounded summary) end up bounded to
+    // the checkpoint. Deleting the stale JSONL first keeps a lingering warm-resume
+    // path from re-hydrating full pre-restore history if reconnect races the truncation.
+    if (!keepSessionAlive) {
+      if (adapter === "claude") {
+        try {
+          await unlink(
+            getSessionJsonlPath(sessionIdBeforeRestore, repositoryPath),
           );
+        } catch (err: unknown) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code !== "ENOENT") {
+            this.logger.warn(
+              "Failed to delete stale session JSONL before restore reconnect",
+              { error: err instanceof Error ? err.message : String(err) },
+            );
+          }
         }
       }
+      await this.cleanupSession();
     }
-    await this.cleanupSession();
 
+    this.logger.info("CloudRestore: complete", {
+      checkpointId,
+      keepSessionAlive,
+      truncationFailed,
+      totalMs: since(),
+    });
     return { truncationFailed, adapter };
   }
 

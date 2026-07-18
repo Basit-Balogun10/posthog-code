@@ -104,6 +104,10 @@ export const closeParamsSchema = z
 
 export const restoreCheckpointParamsSchema = z.object({
   checkpointId: z.string().min(1, "checkpointId is required"),
+  // Set by the desktop's cloud-origin restore (restore WHILE the sandbox is live) so
+  // the sandbox reverts git + truncates the log but keeps its ACP session/event stream
+  // warm instead of tearing down (which would end the durable stream and wedge the run).
+  keepSessionAlive: z.boolean().optional(),
 });
 
 export const commandParamsSchemas = {

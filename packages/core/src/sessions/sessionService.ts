@@ -535,6 +535,18 @@ export class SessionService {
   private dispatchingCloudQueues = new Set<string>();
   /** Coalesces deferred cloud queue flush timers (per taskId). */
   private scheduledCloudQueueFlushes = new Set<string>();
+  /**
+   * Waiters for a live cloud-origin restore's real `restore_complete` broadcast, keyed by
+   * checkpointId. The sandbox emits the broadcast only AFTER it has actually reverted the git
+   * tree + truncated the log — unlike the `restore_checkpoint` command's HTTP response, which
+   * aborts after a 30s fetch timeout even while the sandbox is still (correctly) reverting a
+   * checkpoint it had to materialize from S3. restoreCloudCheckpoint awaits this instead of the
+   * command result; handleSessionEvent resolves it when the broadcast arrives.
+   */
+  private pendingCloudRestores = new Map<
+    string,
+    (result: { truncationFailed?: boolean }) => void
+  >();
   private cloudRunIdleTracker: CloudRunIdleTracker;
   private nextCloudTaskWatchToken = 0;
   private supersededRunIds = new Set<string>();
@@ -2122,6 +2134,14 @@ export class SessionService {
         truncationFailed?: boolean;
       };
       if (params?.checkpointId) {
+        // Resolve any restoreCloudCheckpoint waiting on the sandbox's REAL completion
+        // signal (see pendingCloudRestores). This is the authoritative "revert + truncate
+        // done" event; the command HTTP response is not (it can abort mid-materialize).
+        const pending = this.pendingCloudRestores.get(params.checkpointId);
+        if (pending) {
+          this.pendingCloudRestores.delete(params.checkpointId);
+          pending({ truncationFailed: params.truncationFailed });
+        }
         const trimmed = sessionStoreSetters.truncateEventsToCheckpoint(
           session.taskId,
           params.checkpointId,
@@ -2713,10 +2733,17 @@ export class SessionService {
     // `clientConnection.prompt(initialPrompt)` on the same ACP session.
     // Funnel through the queue; the run_started or turn_complete
     // handlers will drain it once the agent is provably ready.
+    //
+    // `isReconnecting` also covers the brief window of a cloud-origin restore
+    // (restoreCloudCheckpoint's live-sandbox path): while the sandbox is mid
+    // git-revert + log-truncate, `status` stays "connected", so without this a
+    // freshly-sent message would race the restore. restoreCloudCheckpoint clears
+    // the flag inline the moment the restore command returns (the session stays
+    // warm — no teardown), then drains anything queued here.
     if (
       !options?.skipQueueGuard &&
       session.isCloud &&
-      session.status !== "connected"
+      (session.status !== "connected" || session.isReconnecting)
     ) {
       this.d.store.enqueueMessage(
         session.taskId,
@@ -2726,6 +2753,7 @@ export class SessionService {
       this.d.log.info("Cloud message queued (agent not ready)", {
         taskId: session.taskId,
         sessionStatus: session.status,
+        isReconnecting: session.isReconnecting,
         queueLength: session.messageQueue.length + 1,
       });
       // The watcher may have exhausted its reconnect budget and been left in a
@@ -3647,6 +3675,145 @@ export class SessionService {
     if (!auth) {
       throw new Error("No cloud auth credentials available");
     }
+
+    // Prefer the sandbox-driven restore when the sandbox is LIVE. handleRestoreCheckpoint
+    // (agent-server) reverts the working tree, truncates the log, broadcasts RESTORE_COMPLETE,
+    // and tears its session down so it rebuilds bounded to the checkpoint (memory too) — the
+    // same complete path local restore uses. The server-side truncate below only reverts
+    // MEMORY; on a live sandbox the git tree would keep the undone turns, because
+    // reconcileResumeGitCheckpoint runs only on a RESUME, which a still-alive sandbox skips
+    // (its next turn arrives as a live /command, not a resume). It's either/or — the sandbox
+    // truncates here, or the server truncates below, never both, so there's no double-truncate.
+    if (session.cloudStatus === "in_progress") {
+      // Live-sandbox restore. The sandbox reverts its working tree, truncates the durable
+      // log, and broadcasts RESTORE_COMPLETE, but — because we pass keepSessionAlive — it
+      // does NOT tear its ACP session down. Tearing down would end the durable event stream
+      // (STREAM_END sentinel), which permanently stops the desktop's cloud watcher with no
+      // reconnect, wedging the run; keeping the session warm leaves the stream intact so the
+      // next turn streams back normally.
+      //
+      // COMPLETION IS BROADCAST-DRIVEN, NOT COMMAND-RESPONSE-DRIVEN. The `restore_checkpoint`
+      // command blocks its HTTP response on the full revert, but the desktop's fetch aborts
+      // after a 30s timeout (AUTH_FETCH_TIMEOUT_MS). A restore whose target checkpoint must be
+      // materialized from S3 first (e.g. a LOCAL-origin checkpoint restored while cloud-
+      // resident) routinely exceeds that — so command.success would be false even though the
+      // sandbox is still correctly reverting, and we'd wrongly fall to the server-side truncate
+      // (which bounds memory but NEVER reverts git). Instead we wait for the sandbox's REAL
+      // `restore_complete` broadcast (emitted only after the revert + truncate finish), which
+      // flows over the kept-alive stream. We only fall back to server-side if that broadcast
+      // never arrives within a generous ceiling (sandbox genuinely unreachable/failed).
+      //
+      // isReconnecting gates input (sendCloudPrompt queues) for the whole window so nothing
+      // races the sandbox mid-revert; cleared once the broadcast lands (or we give up).
+      this.d.store.updateSession(session.taskRunId, { isReconnecting: true });
+      const broadcast = new Promise<{ truncationFailed?: boolean }>(
+        (resolve) => {
+          this.pendingCloudRestores.set(checkpointId, resolve);
+        },
+      );
+      // Fire the command but DON'T let its (likely-timing-out) result decide success. Capture
+      // a fast, non-timeout failure though — that means the sandbox is genuinely unreachable.
+      let fastFailure: string | undefined;
+      const commandSettled = this.d.trpc.cloudTask.sendCommand
+        .mutate({
+          taskId: session.taskId,
+          runId: session.taskRunId,
+          apiHost: auth.apiHost,
+          teamId: auth.teamId,
+          method: "restore_checkpoint",
+          params: { checkpointId, keepSessionAlive: true },
+        })
+        .then((command) => {
+          if (!command.success) fastFailure = command.error ?? "unknown";
+        })
+        .catch((err: unknown) => {
+          fastFailure = err instanceof Error ? err.message : String(err);
+        });
+
+      // The sandbox's revert is SLOW — a native checkpoint takes ~3 min under the per-repo
+      // write-lock contention (same issue that makes captures ~3 min), and a LOCAL-origin
+      // target needs an S3 materialize on top. The real restore_complete broadcast only fires
+      // after that finishes, so the ceiling must clear it comfortably or we fall back before
+      // the sandbox is done (leaving the git tree unreverted). 6 min is a diagnostic ceiling
+      // pending the revert-perf fix; blocking this long isn't acceptable for the product.
+      // Completion is resolved by a RACE between two independent signals:
+      //   PRIMARY  — the live structured RESTORE_COMPLETE broadcast (handled in
+      //              handleSessionEvent → resolves the pending waiter). Near-instant when the
+      //              desktop's durable SSE stream is healthy, so it normally wins.
+      //   FALLBACK — this durable-log poll. The broadcast rides the SSE stream, which can
+      //              STALL for minutes (it only flushes new events on reconnect) even though
+      //              the sandbox finishes the restore in ~8s and persists its completion marker
+      //              to the durable run log immediately. The poll reads that log directly and,
+      //              on detection, injects a synthetic RESTORE_COMPLETE through the SAME pipeline
+      //              (enqueueSessionEvent → handleSessionEvent) — resolving the waiter and
+      //              trimming the view identically to the broadcast. It only WINS the race when
+      //              the broadcast is delayed; when the broadcast is prompt the poll is a no-op.
+      // Both resolving is harmless/idempotent (the waiter is deleted on first resolve; the view
+      // trim is a no-op the second time). Which one won is logged (poll logs "completion detected
+      // via durable-log poll"; its absence + no timeout warn ⇒ the broadcast won) — main-process
+      // log, not the renderer console.
+      const pollStop = { stopped: false };
+      const resolution: { via: "broadcast" | "durable-poll" } = {
+        via: "broadcast",
+      };
+      void this.pollDurableLogForRestoreComplete(
+        session,
+        checkpointId,
+        pollStop,
+        resolution,
+      );
+
+      const RESTORE_BROADCAST_CEILING_MS = 360_000;
+      const timedOut = Symbol("timeout");
+      const outcome = await Promise.race([
+        broadcast,
+        new Promise<typeof timedOut>((resolve) =>
+          setTimeout(() => resolve(timedOut), RESTORE_BROADCAST_CEILING_MS),
+        ),
+      ]);
+      pollStop.stopped = true;
+      // Which signal actually resolved the restore. Emitted via console.* (not this.d.log,
+      // which doesn't surface in the renderer devtools console the run logs are exported from)
+      // so it's visible when validating a run: "broadcast" = live SSE delivered promptly;
+      // "durable-poll" = SSE stalled and the durable-log fallback won; "timeout" = neither
+      // arrived within the ceiling (fell through to the server-side truncate below).
+      // Diagnostic — remove with the other CloudRestore validation logs before the PR.
+      const resolvedVia = outcome === timedOut ? "timeout" : resolution.via;
+      console.info(
+        `[cloud-restore] checkpoint ${checkpointId} resolved via ${resolvedVia}`,
+      );
+
+      if (outcome !== timedOut) {
+        // Sandbox emitted the real restore_complete → git revert + log truncate genuinely
+        // done. handleSessionEvent already trimmed the live view. Drain anything queued.
+        this.pendingCloudRestores.delete(checkpointId);
+        this.d.store.updateSession(session.taskRunId, {
+          isReconnecting: false,
+        });
+        const drained = this.d.store.getSessions()[session.taskRunId];
+        if (drained && drained.messageQueue.length > 0) {
+          this.scheduleCloudQueueFlush(
+            session.taskId,
+            "cloud-restore-complete",
+          );
+        }
+        return { truncationFailed: outcome.truncationFailed ?? false };
+      }
+
+      // No broadcast within the ceiling. Clean up and fall back to the server-side truncate
+      // (memory-only). Let the command settle first so we can log why (fast-fail vs stall).
+      this.pendingCloudRestores.delete(checkpointId);
+      this.d.store.updateSession(session.taskRunId, { isReconnecting: false });
+      await commandSettled;
+      this.d.log.warn(
+        "Cloud restore: no restore_complete broadcast from live sandbox; falling back to server-side truncate (git tree may not be reverted)",
+        { taskId: session.taskId, checkpointId, fastFailure },
+      );
+    }
+
+    // Server-side path (no live sandbox): truncate the durable S3 log now to bound memory; the
+    // git tree reconciles to the truncated tail on the NEXT sandbox resume
+    // (agent-server reconcileResumeGitCheckpoint).
     const result = await this.d.trpc.cloudTask.truncateLog.mutate({
       taskId: session.taskId,
       runId: session.taskRunId,
@@ -3656,7 +3823,7 @@ export class SessionService {
     });
     // A failed truncate means the agent's memory was NOT bounded — treat as a hard restore
     // failure rather than a silent partial (there's no independent git revert to have succeeded
-    // here, unlike the sandbox-driven path).
+    // here, unlike the sandbox-driven path above).
     if (!result.success) {
       throw new Error(result.error ?? "Cloud checkpoint restore failed");
     }
@@ -3674,6 +3841,128 @@ export class SessionService {
     });
 
     return { truncationFailed: false };
+  }
+
+  /**
+   * Fast, stream-independent completion signal for a live cloud-origin restore. Polls the
+   * durable run log for the agent's persisted restore-complete marker (which lands within
+   * seconds, unlike the structured RESTORE_COMPLETE *broadcast* that can be delayed minutes by
+   * a stalled SSE stream — see findRestoreCompleteMarker for the durable structured event it
+   * keys off, plus the legacy console-line fallback) and, on detection, injects a synthetic
+   * RESTORE_COMPLETE through the normal pipeline so the waiter resolves and the live view trims
+   * exactly as the broadcast would. Stops as soon as `stop.stopped` is set (the race resolved)
+   * or the waiter is gone.
+   */
+  private async pollDurableLogForRestoreComplete(
+    session: AgentSession,
+    checkpointId: string,
+    stop: { stopped: boolean },
+    resolution: { via: "broadcast" | "durable-poll" },
+  ): Promise<void> {
+    const POLL_INTERVAL_MS = 2_500;
+    while (!stop.stopped && this.pendingCloudRestores.has(checkpointId)) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      if (stop.stopped || !this.pendingCloudRestores.has(checkpointId)) return;
+      let entries: StoredLogEntry[];
+      try {
+        const authStatus = await this.getAuthCredentialsStatus();
+        if (authStatus.kind !== "ready") continue;
+        entries = await authStatus.auth.client.getTaskRunSessionLogs(
+          session.taskId,
+          session.taskRunId,
+          { limit: 100_000 },
+        );
+      } catch (err) {
+        this.d.log.warn("Cloud restore poll: durable-log fetch failed", {
+          taskId: session.taskId,
+          checkpointId,
+          err,
+        });
+        continue;
+      }
+      const marker = this.findRestoreCompleteMarker(entries, checkpointId);
+      if (
+        marker &&
+        !stop.stopped &&
+        this.pendingCloudRestores.has(checkpointId)
+      ) {
+        // Set BEFORE injecting: JS is single-threaded, so between this assignment and
+        // enqueueSessionEvent (which resolves the waiter) nothing else runs — the race's
+        // post-resolution attribution reads this synchronously-set flag.
+        resolution.via = "durable-poll";
+        this.d.log.info(
+          "Cloud restore: completion detected via durable-log poll (live SSE stream lagging)",
+          {
+            taskId: session.taskId,
+            checkpointId,
+            truncationFailed: marker.truncationFailed,
+          },
+        );
+        this.enqueueSessionEvent(session.taskRunId, {
+          type: "acp_message",
+          ts: Date.now(),
+          message: {
+            jsonrpc: "2.0",
+            method: POSTHOG_NOTIFICATIONS.RESTORE_COMPLETE,
+            params: { checkpointId, truncationFailed: marker.truncationFailed },
+          },
+        });
+        return;
+      }
+    }
+  }
+
+  /**
+   * Scans durable log entries (newest first) for a completion signal for a specific checkpoint.
+   * PRIMARY signal: the structured `_posthog/restore_complete` notification the agent now persists
+   * durably — a first-class event that survives pre-release log cleanup. FALLBACK: the sandbox's
+   * `CloudRestore: complete` `_posthog/console` line (a diagnostic `[info]` log that gets stripped
+   * before a PR) — kept only so an agent build that predates the durable-structured-event change
+   * still resolves. Both carry `truncationFailed`. Returns null until a signal appears.
+   */
+  private findRestoreCompleteMarker(
+    entries: StoredLogEntry[],
+    checkpointId: string,
+  ): { truncationFailed: boolean } | null {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const notif = entries[i]?.notification;
+      if (!notif) continue;
+
+      // PRIMARY: durable structured event.
+      if (notif.method === POSTHOG_NOTIFICATIONS.RESTORE_COMPLETE) {
+        const params = notif.params as
+          | { checkpointId?: string; truncationFailed?: boolean }
+          | undefined;
+        if (params?.checkpointId === checkpointId) {
+          return { truncationFailed: params.truncationFailed === true };
+        }
+        continue;
+      }
+
+      // FALLBACK: legacy console-line scrape (deprecated; removable once every agent
+      // build persists the structured event above).
+      if (notif.method === POSTHOG_NOTIFICATIONS.CONSOLE) {
+        const message = (notif.params as { message?: string } | undefined)
+          ?.message;
+        if (typeof message !== "string") continue;
+        if (!message.startsWith("CloudRestore: complete")) continue;
+        if (!message.includes(checkpointId)) continue;
+        let truncationFailed = false;
+        const braceIdx = message.indexOf("{");
+        if (braceIdx !== -1) {
+          try {
+            const parsed = JSON.parse(message.slice(braceIdx)) as {
+              truncationFailed?: boolean;
+            };
+            truncationFailed = parsed.truncationFailed === true;
+          } catch {
+            // Malformed tail — keep the safe default (assume trim succeeded).
+          }
+        }
+        return { truncationFailed };
+      }
+    }
+    return null;
   }
 
   async restoreCheckpointReconnect(

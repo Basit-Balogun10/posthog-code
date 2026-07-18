@@ -60,6 +60,7 @@ export function ChatThreadFooter({
         hasPendingPermission={pendingPermissions.size > 0}
         pausedDurationMs={pausedDurationMs}
         isCompacting={isCompacting}
+        isReconnecting={session?.isReconnecting ?? false}
         usage={contextUsage}
         completedToolCallCount={completedToolCallCount}
       />
